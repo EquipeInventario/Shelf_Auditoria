@@ -5,11 +5,8 @@ import pymysql
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="API Base Ambev", version="3.0.0")
+app = FastAPI(title="API Base Ambev", version="4.0.0")
 
-# =========================
-# CORS
-# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,38 +15,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# ENV
-# =========================
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
-# USANDO TESTE, ALTERAR DEPOIS
+
 DB_NAME_BASE = os.getenv("DB_NAME_BASE", "teste_ambev")
 DB_NAME_INVENTARIO = os.getenv("DB_NAME_INVENTARIO", "inventario")
 
-# =========================
-# TABELAS SUPORTADAS
-# =========================
 TABLES = {
-    "estoque": {
-        "db": DB_NAME_BASE,
-        "pk": "ID",
-    },
-    "historico_alteracoes": {
-        "db": DB_NAME_BASE,
-        "pk": "ID",
-    },
-    "log": {
-        "db": DB_NAME_INVENTARIO,
-        "pk": "id",
-    },
+    "estoque": {"db": DB_NAME_BASE, "pk": "ID"},
+    "historico_alteracoes": {"db": DB_NAME_BASE, "pk": "ID"},
+    "produtos": {"db": DB_NAME_BASE, "pk": "ID"},
+    "log": {"db": DB_NAME_INVENTARIO, "pk": "id"},
 }
 
-# =========================
-# CONEXÃO
-# =========================
+
 def get_conn(database_name: str):
     if not DB_HOST or not DB_USER or not DB_PASSWORD:
         return None
@@ -81,7 +62,10 @@ def _open_db(table_name: str):
     cfg = get_table_cfg(table_name)
     conn = get_conn(cfg["db"])
     if not conn:
-        raise HTTPException(status_code=500, detail=f"Erro na conexão com o banco {cfg['db']}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro na conexão com o banco {cfg['db']}",
+        )
     return conn, cfg["pk"]
 
 
@@ -257,9 +241,123 @@ def _delete_row(table_name: str, item_id: int):
         conn.close()
 
 
-# =========================
-# ROOT / HEALTH
-# =========================
+def _norm_text(value: Any) -> str:
+    return ("" if value is None else str(value)).strip()
+
+
+def _norm_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    text = text.replace(".", "").replace(",", ".")
+    try:
+        return int(float(text))
+    except Exception:
+        return default
+
+
+def _fetch_produto_row(conn, produto: str):
+    produto = _norm_text(produto)
+    if not produto:
+        return None
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT ID, PRODUTO, DESCRICAO, ABREVIACAO, SHELF, VALIDADE_DIAS, PACKS,
+                   exigeFornecedor, exigeLote, tipo_produto, exigeLinha, exigeDocExtra
+            FROM produtos
+            WHERE PRODUTO = %s
+            LIMIT 1
+            """,
+            (produto,),
+        )
+        return cursor.fetchone()
+
+
+def _get_produto_packs(produto: str) -> int:
+    conn, _ = _open_db("produtos")
+    try:
+        row = _fetch_produto_row(conn, produto)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Produto não encontrado: {produto}")
+
+        packs = _norm_int(row.get("PACKS"), 0)
+        if not packs or packs <= 0:
+            raise HTTPException(status_code=400, detail=f"PACKS inválido para o produto {produto}")
+
+        return packs
+    finally:
+        conn.close()
+
+
+def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None) -> Dict[str, Any]:
+    payload = dict(data)
+
+    payload.pop("SITUACAO3", None)
+    payload.pop("situacao3", None)
+
+    if not _norm_text(payload.get("CHECKLIST_MASTER")):
+        payload["CHECKLIST_MASTER"] = "[00000]"
+
+    if "PRODUTO" in payload:
+        payload["PRODUTO"] = _norm_text(payload["PRODUTO"])
+    if "lote" in payload:
+        payload["lote"] = _norm_text(payload["lote"])
+    if "linha" in payload:
+        payload["linha"] = _norm_text(payload["linha"])
+    if "AZ" in payload:
+        payload["AZ"] = _norm_int(payload["AZ"])
+    if "RUA" in payload:
+        payload["RUA"] = _norm_int(payload["RUA"])
+    if "QUANTIDADE_PLT" in payload:
+        payload["QUANTIDADE_PLT"] = _norm_int(payload["QUANTIDADE_PLT"], 0)
+
+    payload.pop("QUANTIDADE_PACK", None)
+
+    conn, _ = _open_db("estoque")
+    try:
+        base_row = None
+        if item_id is not None:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM estoque WHERE ID = %s LIMIT 1", (item_id,))
+                base_row = cursor.fetchone()
+
+            if not base_row:
+                raise HTTPException(status_code=404, detail="Registro não encontrado")
+
+        merged: Dict[str, Any] = {}
+        if base_row:
+            merged.update(base_row)
+        merged.update(payload)
+
+        produto = _norm_text(merged.get("PRODUTO"))
+        if not produto:
+            raise HTTPException(status_code=400, detail="Campo PRODUTO é obrigatório")
+
+        qtd_plt = _norm_int(merged.get("QUANTIDADE_PLT"), None)
+        if qtd_plt is None:
+            raise HTTPException(status_code=400, detail="Campo QUANTIDADE_PLT é obrigatório")
+
+        packs = _get_produto_packs(produto)
+        merged["QUANTIDADE_PACK"] = int(qtd_plt) * int(packs)
+
+        if not _norm_text(merged.get("CHECKLIST_MASTER")):
+            merged["CHECKLIST_MASTER"] = "[00000]"
+
+        merged.pop("SITUACAO3", None)
+        merged.pop("situacao3", None)
+        return merged
+    finally:
+        conn.close()
+
+
 @app.get("/")
 def root():
     return {
@@ -272,6 +370,82 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# =========================================================
+# PRODUTOS
+# =========================================================
+@app.get("/produtos")
+def listar_produtos(request: Request):
+    return _select_all("produtos", request)
+
+
+@app.get("/produtos/{item_id}")
+def obter_produto(item_id: int):
+    return _select_by_id("produtos", item_id)
+
+
+@app.get("/produtos/codigo/{produto}")
+def obter_produto_por_codigo(produto: str):
+    conn, _ = _open_db("produtos")
+    try:
+        row = _fetch_produto_row(conn, produto)
+        if not row:
+            raise HTTPException(status_code=404, detail="Produto não encontrado")
+        return row
+    finally:
+        conn.close()
+
+
+@app.get("/produtos/pack/{produto}")
+def obter_pack_produto(produto: str):
+    conn, _ = _open_db("produtos")
+    try:
+        row = _fetch_produto_row(conn, produto)
+        if not row:
+            raise HTTPException(status_code=404, detail="Produto não encontrado")
+
+        packs = _norm_int(row.get("PACKS"), 0)
+        return {"PRODUTO": row.get("PRODUTO"), "PACKS": packs}
+    finally:
+        conn.close()
+
+
+@app.get("/produtos/pack/{produto}/calcular")
+def calcular_pack_produto(produto: str, qtd_plt: int):
+    conn, _ = _open_db("produtos")
+    try:
+        row = _fetch_produto_row(conn, produto)
+        if not row:
+            raise HTTPException(status_code=404, detail="Produto não encontrado")
+
+        packs = _norm_int(row.get("PACKS"), 0)
+        if not packs or packs <= 0:
+            raise HTTPException(status_code=400, detail="PACKS inválido para o produto")
+
+        return {
+            "PRODUTO": row.get("PRODUTO"),
+            "PACKS": packs,
+            "QUANTIDADE_PLT": qtd_plt,
+            "QUANTIDADE_PACK": int(qtd_plt) * int(packs),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/produtos")
+def inserir_produto(data: Dict[str, Any]):
+    return _insert_row("produtos", data)
+
+
+@app.put("/produtos/{item_id}")
+def atualizar_produto(item_id: int, data: Dict[str, Any]):
+    return _update_row("produtos", item_id, data)
+
+
+@app.delete("/produtos/{item_id}")
+def deletar_produto(item_id: int):
+    return _delete_row("produtos", item_id)
 
 
 # =========================================================
@@ -289,12 +463,14 @@ def obter_estoque(item_id: int):
 
 @app.post("/estoque")
 def inserir_estoque(data: Dict[str, Any]):
-    return _insert_row("estoque", data)
+    payload = _prepare_estoque_payload(data)
+    return _insert_row("estoque", payload)
 
 
 @app.put("/estoque/{item_id}")
 def atualizar_estoque(item_id: int, data: Dict[str, Any]):
-    return _update_row("estoque", item_id, data)
+    payload = _prepare_estoque_payload(data, item_id=item_id)
+    return _update_row("estoque", item_id, payload)
 
 
 @app.delete("/estoque/{item_id}")
@@ -448,8 +624,8 @@ def deletar_log(item_id: int):
 # =========================================================
 @app.post("/auth/login")
 def login(data: Dict[str, Any]):
-    login_user = str(data.get("login", "")).strip()
-    senha = str(data.get("senha", "")).strip()
+    login_user = _norm_text(data.get("login"))
+    senha = _norm_text(data.get("senha"))
 
     if not login_user or not senha:
         raise HTTPException(status_code=400, detail="login e senha são obrigatórios")
