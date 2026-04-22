@@ -25,7 +25,7 @@ DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
-// USANDO TESTE, ALTERAR DEPOIS //
+# USANDO TESTE, ALTERAR DEPOIS
 DB_NAME_BASE = os.getenv("DB_NAME_BASE", "teste_ambev")
 DB_NAME_INVENTARIO = os.getenv("DB_NAME_INVENTARIO", "inventario")
 
