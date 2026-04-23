@@ -355,6 +355,7 @@ def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None
         merged.pop("situacao3", None)
         merged.pop("DATA_SHELF", None)
         merged.pop("DATA_BLOQ", None)
+        merged.pop("DATA_VALIDADE", None)
         
         return merged
     finally:
