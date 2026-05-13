@@ -72,6 +72,6 @@ jobs:
           app-name: 'apiauditoria'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_68672068B72F4ACC88F065A00C75B3D7 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_76EFD3CADFE6445CB92C62B0D6827C4C }}
           sku: 'flexconsumption'
         
