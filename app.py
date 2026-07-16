@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # APP
 # =========================================================
-app = FastAPI(title="API Base Ambev", version="6.1.0")
+app = FastAPI(title="API Base Ambev", version="6.3.0")
 fastapi_app = app  # alias mantido apenas para compatibilidade local
 
 app.add_middleware(
@@ -316,6 +316,39 @@ def _registrar_atividade_conn(
                 detalhes_json,
             ),
         )
+
+
+def _registrar_atividade_segura(
+    *,
+    sessao: Dict[str, Any],
+    tipo_evento: str,
+    tela: Optional[str] = None,
+    referencia_id: Optional[str] = None,
+    detalhes: Any = None,
+):
+    """Registra atividade sem fazer a operação principal falhar."""
+    conn, _ = _open_db("app_atividades")
+    try:
+        _atualizar_heartbeat_conn(
+            conn,
+            sessao_uuid=_norm_text(sessao.get("sessao_uuid")),
+            em_atividade=True,
+        )
+        _registrar_atividade_conn(
+            conn,
+            sessao_uuid=_norm_text(sessao.get("sessao_uuid")),
+            id_usuario=int(sessao.get("id_usuario")),
+            tipo_evento=tipo_evento,
+            tela=tela,
+            referencia_id=referencia_id,
+            detalhes=detalhes,
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        print(f"Falha ao registrar atividade {tipo_evento}: {e}")
+    finally:
+        conn.close()
 
 
 def _atualizar_heartbeat_conn(
@@ -843,20 +876,68 @@ def obter_estoque(item_id: int):
 
 
 @app.post("/estoque")
-def inserir_estoque(data: Dict[str, Any]):
+def inserir_estoque(
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao = _exigir_sessao_header(x_session_uuid)
     payload = _prepare_estoque_payload(data)
-    return _insert_row("estoque", payload)
+    resultado = _insert_row("estoque", payload)
+    novo_id = resultado.get("ID") or resultado.get("id")
+
+    _registrar_atividade_segura(
+        sessao=sessao,
+        tipo_evento="ITEM_INSERIDO",
+        tela="auditoria",
+        referencia_id=str(novo_id) if novo_id is not None else None,
+        detalhes={
+            "produto": payload.get("PRODUTO"),
+            "qd": payload.get("QD"),
+            "rua": payload.get("RUA"),
+        },
+    )
+    return resultado
 
 
 @app.put("/estoque/{item_id}")
-def atualizar_estoque(item_id: int, data: Dict[str, Any]):
+def atualizar_estoque(
+    item_id: int,
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao = _exigir_sessao_header(x_session_uuid)
     payload = _prepare_estoque_payload(data, item_id=item_id)
-    return _update_row("estoque", item_id, payload)
+    resultado = _update_row("estoque", item_id, payload)
+
+    _registrar_atividade_segura(
+        sessao=sessao,
+        tipo_evento="ITEM_EDITADO",
+        tela="auditoria",
+        referencia_id=str(item_id),
+        detalhes={
+            "produto": payload.get("PRODUTO"),
+            "qd": payload.get("QD"),
+            "rua": payload.get("RUA"),
+        },
+    )
+    return resultado
 
 
 @app.delete("/estoque/{item_id}")
-def deletar_estoque(item_id: int):
-    return _delete_row("estoque", item_id)
+def deletar_estoque(
+    item_id: int,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao = _exigir_sessao_header(x_session_uuid)
+    resultado = _delete_row("estoque", item_id)
+
+    _registrar_atividade_segura(
+        sessao=sessao,
+        tipo_evento="ITEM_EXCLUIDO",
+        tela="auditoria",
+        referencia_id=str(item_id),
+    )
+    return resultado
 
 
 
@@ -865,31 +946,64 @@ def deletar_estoque(item_id: int):
 # HISTORICO_ALTERACOES
 # =========================================================
 @app.get("/historico")
-def listar_historico(request: Request):
+def listar_historico(
+    request: Request,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_GESTAO)
     return _select_all("historico_alteracoes", request)
 
 
 @app.get("/historico/app")
 def listar_historico_app(
+    escopo: str = "meu",
     usuario: Optional[str] = None,
     limit: int = 200,
     offset: int = 0,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
-    limit, offset = _safe_limit_offset(limit, offset, default_limit=200, max_limit=500)
+    """
+    Colaborador comum recebe sempre apenas o próprio histórico.
+    Gestor e administrador podem usar escopo=todos para consultar toda a equipe.
+    O nome usado para o filtro individual vem da sessão autenticada, e não do app.
+    """
+    sessao = _exigir_sessao_header(x_session_uuid)
+    perfil = _normalizar_perfil(sessao.get("perfil"))
+    escopo_normalizado = _norm_text(escopo).lower()
 
-    nome_usuario = _norm_text(usuario).split(" - ")[0].strip().lower()
+    limit, offset = _safe_limit_offset(
+        limit,
+        offset,
+        default_limit=200,
+        max_limit=1000,
+    )
 
-    filters = ["USUARIO_SISTEMA IS NOT NULL", "LOWER(USUARIO_SISTEMA) LIKE %s"]
+    pode_ver_todos = perfil in PERFIS_GESTAO and escopo_normalizado == "todos"
+
+    filters = [
+        "USUARIO_SISTEMA IS NOT NULL",
+        "LOWER(USUARIO_SISTEMA) LIKE %s",
+    ]
     values = ["%app%"]
 
-    if nome_usuario:
+    if pode_ver_todos:
+        nome_filtro = _norm_text(usuario).split(" - ")[0].strip().lower()
+        if nome_filtro:
+            filters.append("LOWER(USUARIO_SISTEMA) LIKE %s")
+            values.append(f"%{nome_filtro}%")
+    else:
+        nome_sessao = _norm_text(sessao.get("nome")).split(" - ")[0].strip().lower()
+        if not nome_sessao:
+            raise HTTPException(
+                status_code=400,
+                detail="Nome do usuário autenticado não está disponível",
+            )
         filters.append("LOWER(USUARIO_SISTEMA) LIKE %s")
-        values.append(f"%{nome_usuario}%")
+        values.append(f"%{nome_sessao}%")
 
     values.extend([limit, offset])
 
     conn, _ = _open_db("historico_alteracoes")
-
     try:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -902,7 +1016,6 @@ def listar_historico_app(
                 """,
                 values,
             )
-
             return cursor.fetchall()
     finally:
         conn.close()
@@ -912,11 +1025,12 @@ def listar_historico_app(
 def listar_historico_paginado(
     limit: int = 50,
     offset: int = 0,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
+    _exigir_sessao_header(x_session_uuid, PERFIS_GESTAO)
     limit, offset = _safe_limit_offset(limit, offset, default_limit=50, max_limit=500)
 
     conn, _ = _open_db("historico_alteracoes")
-
     try:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -928,34 +1042,55 @@ def listar_historico_paginado(
                 """,
                 (limit, offset),
             )
-
             return cursor.fetchall()
     finally:
         conn.close()
 
 
 @app.get("/historico/{item_id}")
-def obter_historico(item_id: int):
+def obter_historico(
+    item_id: int,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_GESTAO)
     return _select_by_id("historico_alteracoes", item_id)
 
 
 @app.post("/historico")
-def inserir_historico(data: Dict[str, Any]):
+def inserir_historico(
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid)
     return _insert_row("historico_alteracoes", data)
 
 
 @app.put("/historico/{item_id}")
-def atualizar_historico(item_id: int, data: Dict[str, Any]):
+def atualizar_historico(
+    item_id: int,
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_GESTAO)
     return _update_row("historico_alteracoes", item_id, data)
 
 
 @app.delete("/historico/{item_id}")
-def deletar_historico(item_id: int):
+def deletar_historico(
+    item_id: int,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
     return _delete_row("historico_alteracoes", item_id)
 
 
 @app.get("/historico/por-relacao/{id_relacao}")
-def historico_por_relacao(id_relacao: str):
+def historico_por_relacao(
+    id_relacao: str,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_GESTAO)
+
     conn, _ = _open_db("historico_alteracoes")
     try:
         with conn.cursor() as cursor:
