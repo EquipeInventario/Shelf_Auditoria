@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # APP
 # =========================================================
-app = FastAPI(title="API Base Ambev", version="6.3.1")
+app = FastAPI(title="API Base Ambev", version="6.4.0")
 fastapi_app = app  # alias mantido apenas para compatibilidade local
 
 app.add_middleware(
@@ -156,6 +156,12 @@ HEARTBEAT_TIMEOUT_SECONDS = max(
 PERFIS_GESTAO: Set[str] = {"gestor", "administrador"}
 PERFIS_ADMIN: Set[str] = {"administrador"}
 
+# O painel desta aplicação acompanha somente a operação Shelf.
+# Usuários do setor ADM podem acessar o sistema quando forem gestor/administrador,
+# mas não aparecem como colaboradores produtivos do Shelf.
+SETOR_PRODUTIVIDADE = "shelf"
+SETORES_GESTAO_GLOBAL: Set[str] = {"adm"}
+
 
 def _norm_bool(value: Any, default: bool = True) -> bool:
     if value is None:
@@ -182,6 +188,19 @@ def _normalizar_perfil(value: Any) -> str:
         return "gestor"
 
     return "colaborador"
+
+
+def _normalizar_setor(value: Any) -> str:
+    setor = _norm_text(value).lower()
+
+    if setor in {"shelf", "auditoria", "shelf auditoria"}:
+        return "shelf"
+    if setor in {"inventario", "inventário", "inventory"}:
+        return "inventario"
+    if setor in {"adm", "administrativo", "administracao", "administração"}:
+        return "adm"
+
+    return setor
 
 
 def _parse_data_ref(value: Optional[str]) -> Optional[date]:
@@ -224,6 +243,7 @@ def _carregar_sessao_conn(conn, sessao_uuid: str, *, for_update: bool = False):
                 l.nome,
                 l.login,
                 l.perfil,
+                l.setor,
                 TIMESTAMPDIFF(
                     SECOND,
                     COALESCE(s.ultimo_heartbeat, s.login_em),
@@ -253,8 +273,10 @@ def _exigir_sessao_conn(
         raise HTTPException(status_code=401, detail="Sessão encerrada ou expirada")
 
     perfil = _normalizar_perfil(sessao.get("perfil"))
+    setor = _normalizar_setor(sessao.get("setor"))
     sessao["perfil"] = perfil
     sessao["colaborador"] = perfil
+    sessao["setor"] = setor
 
     if perfis_permitidos and perfil not in perfis_permitidos:
         raise HTTPException(status_code=403, detail="Acesso não autorizado")
@@ -1122,9 +1144,9 @@ def listar_log(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login, perfil
+                SELECT id, nome, login, perfil, setor
                 FROM log
-                ORDER BY nome, login
+                ORDER BY setor, nome, login
                 """
             )
             rows = cursor.fetchall()
@@ -1133,6 +1155,7 @@ def listar_log(
             perfil = _normalizar_perfil(row.get("perfil"))
             row["colaborador"] = perfil
             row["perfil"] = perfil
+            row["setor"] = _normalizar_setor(row.get("setor"))
 
         return rows
     finally:
@@ -1151,7 +1174,7 @@ def obter_log(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login, perfil
+                SELECT id, nome, login, perfil, setor
                 FROM log
                 WHERE id = %s
                 LIMIT 1
@@ -1166,6 +1189,7 @@ def obter_log(
         perfil = _normalizar_perfil(row.get("perfil"))
         row["colaborador"] = perfil
         row["perfil"] = perfil
+        row["setor"] = _normalizar_setor(row.get("setor"))
         return row
     finally:
         conn.close()
@@ -1187,6 +1211,9 @@ def inserir_log(
     payload.pop("colaborador", None)
     payload["perfil"] = _normalizar_perfil(perfil_recebido)
 
+    if "setor" in payload:
+        payload["setor"] = _normalizar_setor(payload.get("setor"))
+
     return _insert_row("log", payload)
 
 
@@ -1206,6 +1233,9 @@ def atualizar_log(
         perfil_recebido = payload.get("perfil", payload.get("colaborador"))
         payload.pop("colaborador", None)
         payload["perfil"] = _normalizar_perfil(perfil_recebido)
+
+    if "setor" in payload:
+        payload["setor"] = _normalizar_setor(payload.get("setor"))
 
     return _update_row("log", item_id, payload)
 
@@ -1240,13 +1270,14 @@ def login(data: Dict[str, Any]):
     plataforma = _norm_text(data.get("plataforma")) or None
     dispositivo = _norm_text(data.get("dispositivo")) or None
     versao_app = _norm_text(data.get("versao_app")) or None
+    setor_app = _normalizar_setor(data.get("setor_app"))
 
     conn, _ = _open_db("log")
     try:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login, perfil
+                SELECT id, nome, login, perfil, setor
                 FROM log
                 WHERE login = %s AND senha = %s
                 LIMIT 1
@@ -1259,6 +1290,23 @@ def login(data: Dict[str, Any]):
             raise HTTPException(status_code=401, detail="Usuário ou senha inválidos")
 
         perfil = _normalizar_perfil(user.get("perfil"))
+        setor_usuario = _normalizar_setor(user.get("setor"))
+
+        # Quando o aplicativo informa seu setor, bloqueia usuários de outra
+        # operação. ADM permanece como setor corporativo autorizado.
+        if setor_app:
+            acesso_mesmo_setor = setor_usuario == setor_app
+            acesso_gestao_global = (
+                setor_usuario in SETORES_GESTAO_GLOBAL
+                and perfil in PERFIS_GESTAO
+            )
+
+            if not acesso_mesmo_setor and not acesso_gestao_global:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Usuário não autorizado para este sistema",
+                )
+
         sessao_uuid = str(uuid.uuid4())
 
         with conn.cursor() as cursor:
@@ -1323,6 +1371,8 @@ def login(data: Dict[str, Any]):
                 "plataforma": plataforma,
                 "dispositivo": dispositivo,
                 "versao_app": versao_app,
+                "setor_app": setor_app or None,
+                "setor_usuario": setor_usuario or None,
             },
         )
 
@@ -1330,6 +1380,7 @@ def login(data: Dict[str, Any]):
 
         user["colaborador"] = perfil
         user["perfil"] = perfil
+        user["setor"] = setor_usuario
 
         return {
             "status": "ok",
@@ -1367,6 +1418,7 @@ def auth_me(
                 "login": sessao.get("login"),
                 "colaborador": sessao.get("perfil"),
                 "perfil": sessao.get("perfil"),
+                "setor": sessao.get("setor"),
             },
             "sessao": {
                 "sessao_uuid": sessao.get("sessao_uuid"),
@@ -1556,6 +1608,7 @@ def painel_produtividade(
                     l.nome,
                     l.login,
                     l.perfil,
+                    l.setor,
 
                     s.primeiro_login,
                     s.ultimo_login,
@@ -1624,6 +1677,8 @@ def painel_produtividade(
                     GROUP BY id_usuario
                 ) a ON a.id_usuario = l.id
 
+                WHERE LOWER(TRIM(COALESCE(l.setor, ''))) = %s
+
                 ORDER BY
                     CASE WHEN s.primeiro_login IS NULL THEN 1 ELSE 0 END,
                     s.primeiro_login,
@@ -1634,6 +1689,7 @@ def painel_produtividade(
                     data_consulta,
                     data_consulta,
                     data_consulta,
+                    SETOR_PRODUTIVIDADE,
                 ),
             )
             rows = cursor.fetchall()
@@ -1644,6 +1700,13 @@ def painel_produtividade(
 
         for row in rows:
             perfil = _normalizar_perfil(row.get("perfil"))
+            setor = _normalizar_setor(row.get("setor"))
+
+            # Defesa adicional: a consulta já filtra Shelf, mas o retorno
+            # também é validado antes de montar o painel.
+            if setor != SETOR_PRODUTIVIDADE:
+                continue
+
             if not incluir_gestao and perfil != "colaborador":
                 continue
 
@@ -1685,6 +1748,7 @@ def painel_produtividade(
 
             row["colaborador"] = perfil
             row["perfil"] = perfil
+            row["setor"] = setor
             row["status_atual"] = status_atual
             row["alteracoes_realizadas"] = (
                 int(row.get("itens_inseridos") or 0)
@@ -1733,10 +1797,12 @@ def painel_produtividade(
         return {
             "status": "ok",
             "data_ref": data_consulta,
+            "setor": SETOR_PRODUTIVIDADE,
             "solicitante": {
                 "id": solicitante.get("id_usuario"),
                 "nome": solicitante.get("nome"),
                 "perfil": solicitante.get("perfil"),
+                "setor": solicitante.get("setor"),
             },
             "resumo": resumo,
             "colaboradores": colaboradores,
@@ -1775,7 +1841,7 @@ def produtividade_colaborador(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login, perfil
+                SELECT id, nome, login, perfil, setor
                 FROM log
                 WHERE id = %s
                 LIMIT 1
@@ -1788,8 +1854,17 @@ def produtividade_colaborador(
             raise HTTPException(status_code=404, detail="Colaborador não encontrado")
 
         perfil = _normalizar_perfil(usuario.get("perfil"))
+        setor = _normalizar_setor(usuario.get("setor"))
+
+        if setor != SETOR_PRODUTIVIDADE:
+            raise HTTPException(
+                status_code=404,
+                detail="Colaborador não encontrado no setor Shelf",
+            )
+
         usuario["colaborador"] = perfil
         usuario["perfil"] = perfil
+        usuario["setor"] = setor
 
         with conn.cursor() as cursor:
             cursor.execute(
