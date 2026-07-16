@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # =========================================================
 # APP
 # =========================================================
-app = FastAPI(title="API Base Ambev", version="6.3.0")
+app = FastAPI(title="API Base Ambev", version="6.3.1")
 fastapi_app = app  # alias mantido apenas para compatibilidade local
 
 app.add_middleware(
@@ -223,7 +223,7 @@ def _carregar_sessao_conn(conn, sessao_uuid: str, *, for_update: bool = False):
                 s.*,
                 l.nome,
                 l.login,
-                l.colaborador,
+                l.perfil,
                 TIMESTAMPDIFF(
                     SECOND,
                     COALESCE(s.ultimo_heartbeat, s.login_em),
@@ -252,7 +252,7 @@ def _exigir_sessao_conn(
     if _norm_text(sessao.get("status")).upper() != "ATIVA":
         raise HTTPException(status_code=401, detail="Sessão encerrada ou expirada")
 
-    perfil = _normalizar_perfil(sessao.get("colaborador"))
+    perfil = _normalizar_perfil(sessao.get("perfil"))
     sessao["perfil"] = perfil
     sessao["colaborador"] = perfil
 
@@ -1122,7 +1122,7 @@ def listar_log(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login, colaborador
+                SELECT id, nome, login, perfil
                 FROM log
                 ORDER BY nome, login
                 """
@@ -1130,7 +1130,7 @@ def listar_log(
             rows = cursor.fetchall()
 
         for row in rows:
-            perfil = _normalizar_perfil(row.get("colaborador"))
+            perfil = _normalizar_perfil(row.get("perfil"))
             row["colaborador"] = perfil
             row["perfil"] = perfil
 
@@ -1151,7 +1151,7 @@ def obter_log(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login, colaborador
+                SELECT id, nome, login, perfil
                 FROM log
                 WHERE id = %s
                 LIMIT 1
@@ -1163,7 +1163,7 @@ def obter_log(
         if not row:
             raise HTTPException(status_code=404, detail="Registro não encontrado")
 
-        perfil = _normalizar_perfil(row.get("colaborador"))
+        perfil = _normalizar_perfil(row.get("perfil"))
         row["colaborador"] = perfil
         row["perfil"] = perfil
         return row
@@ -1179,7 +1179,14 @@ def inserir_log(
     _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
 
     payload = dict(_ensure_dict(data))
-    payload["colaborador"] = _normalizar_perfil(payload.get("colaborador"))
+
+    # A coluna real da tabela inventario.log é "perfil".
+    # Aceita temporariamente "colaborador" no payload apenas por
+    # compatibilidade com versões anteriores do aplicativo.
+    perfil_recebido = payload.get("perfil", payload.get("colaborador"))
+    payload.pop("colaborador", None)
+    payload["perfil"] = _normalizar_perfil(perfil_recebido)
+
     return _insert_row("log", payload)
 
 
@@ -1192,8 +1199,13 @@ def atualizar_log(
     _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
 
     payload = dict(_ensure_dict(data))
-    if "colaborador" in payload:
-        payload["colaborador"] = _normalizar_perfil(payload.get("colaborador"))
+
+    # Atualiza sempre a coluna real "perfil". Também entende o nome
+    # antigo "colaborador" para não quebrar builds já instalados.
+    if "perfil" in payload or "colaborador" in payload:
+        perfil_recebido = payload.get("perfil", payload.get("colaborador"))
+        payload.pop("colaborador", None)
+        payload["perfil"] = _normalizar_perfil(perfil_recebido)
 
     return _update_row("log", item_id, payload)
 
@@ -1234,7 +1246,7 @@ def login(data: Dict[str, Any]):
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login, colaborador
+                SELECT id, nome, login, perfil
                 FROM log
                 WHERE login = %s AND senha = %s
                 LIMIT 1
@@ -1246,7 +1258,7 @@ def login(data: Dict[str, Any]):
         if not user:
             raise HTTPException(status_code=401, detail="Usuário ou senha inválidos")
 
-        perfil = _normalizar_perfil(user.get("colaborador"))
+        perfil = _normalizar_perfil(user.get("perfil"))
         sessao_uuid = str(uuid.uuid4())
 
         with conn.cursor() as cursor:
@@ -1543,7 +1555,7 @@ def painel_produtividade(
                     l.id AS id_usuario,
                     l.nome,
                     l.login,
-                    l.colaborador,
+                    l.perfil,
 
                     s.primeiro_login,
                     s.ultimo_login,
@@ -1631,7 +1643,7 @@ def painel_produtividade(
         colaboradores = []
 
         for row in rows:
-            perfil = _normalizar_perfil(row.get("colaborador"))
+            perfil = _normalizar_perfil(row.get("perfil"))
             if not incluir_gestao and perfil != "colaborador":
                 continue
 
@@ -1763,7 +1775,7 @@ def produtividade_colaborador(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login, colaborador
+                SELECT id, nome, login, perfil
                 FROM log
                 WHERE id = %s
                 LIMIT 1
@@ -1775,7 +1787,7 @@ def produtividade_colaborador(
         if not usuario:
             raise HTTPException(status_code=404, detail="Colaborador não encontrado")
 
-        perfil = _normalizar_perfil(usuario.get("colaborador"))
+        perfil = _normalizar_perfil(usuario.get("perfil"))
         usuario["colaborador"] = perfil
         usuario["perfil"] = perfil
 
