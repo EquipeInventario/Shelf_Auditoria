@@ -1,14 +1,17 @@
+import json
 import os
-from typing import Any, Dict, Optional
+import uuid
+from datetime import date, datetime
+from typing import Any, Dict, Optional, Set
 
 import pymysql
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
 # APP
 # =========================================================
-app = FastAPI(title="API Base Ambev", version="6.0.0")
+app = FastAPI(title="API Base Ambev", version="6.1.0")
 fastapi_app = app  # alias mantido apenas para compatibilidade local
 
 app.add_middleware(
@@ -26,7 +29,7 @@ async def preflight_handler(full_path: str):
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type,Accept,Authorization",
+            "Access-Control-Allow-Headers": "Content-Type,Accept,Authorization,X-Session-UUID",
             "Access-Control-Max-Age": "86400",
         },
     )
@@ -53,6 +56,8 @@ TABLES = {
     "historico_expedicao": {"db": DB_NAME_BASE, "pk": "ID"},
     "produtos": {"db": DB_NAME_BASE, "pk": "ID"},
     "log": {"db": DB_NAME_INVENTARIO, "pk": "id"},
+    "app_sessoes": {"db": DB_NAME_INVENTARIO, "pk": "id"},
+    "app_atividades": {"db": DB_NAME_INVENTARIO, "pk": "id"},
 }
 
 # =========================================================
@@ -138,6 +143,246 @@ def _safe_limit_offset(limit: Any = 200, offset: Any = 0, *, default_limit: int 
         parsed_offset = 0
 
     return min(parsed_limit, max_limit), parsed_offset
+
+
+# =========================================================
+# SESSÕES / AUTORIZAÇÃO / PRODUTIVIDADE
+# =========================================================
+HEARTBEAT_TIMEOUT_SECONDS = max(
+    60,
+    _norm_int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS"), 180) or 180,
+)
+
+PERFIS_GESTAO: Set[str] = {"gestor", "administrador"}
+PERFIS_ADMIN: Set[str] = {"administrador"}
+
+
+def _norm_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+
+    text = _norm_text(value).lower()
+    if text in {"1", "true", "sim", "s", "yes", "y", "ativo"}:
+        return True
+    if text in {"0", "false", "nao", "não", "n", "no", "inativo"}:
+        return False
+    return default
+
+
+def _normalizar_perfil(value: Any) -> str:
+    perfil = _norm_text(value).lower()
+
+    if perfil in {"administrador", "admin", "adm"}:
+        return "administrador"
+    if perfil in {"gestor", "gerente", "supervisor"}:
+        return "gestor"
+
+    return "colaborador"
+
+
+def _parse_data_ref(value: Optional[str]) -> Optional[date]:
+    text = _norm_text(value)
+    if not text:
+        return None
+
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="data_ref inválida. Use o formato AAAA-MM-DD",
+        )
+
+
+def _get_session_uuid(
+    data: Optional[Dict[str, Any]] = None,
+    header_value: Optional[str] = None,
+) -> str:
+    value = header_value
+    if not _norm_text(value) and isinstance(data, dict):
+        value = data.get("sessao_uuid")
+
+    sessao_uuid = _norm_text(value)
+    if not sessao_uuid:
+        raise HTTPException(status_code=401, detail="Sessão não informada")
+
+    return sessao_uuid
+
+
+def _carregar_sessao_conn(conn, sessao_uuid: str, *, for_update: bool = False):
+    lock_sql = " FOR UPDATE" if for_update else ""
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                s.*,
+                l.nome,
+                l.login,
+                l.colaborador,
+                TIMESTAMPDIFF(
+                    SECOND,
+                    COALESCE(s.ultimo_heartbeat, s.login_em),
+                    NOW()
+                ) AS intervalo_heartbeat
+            FROM app_sessoes s
+            INNER JOIN log l ON l.id = s.id_usuario
+            WHERE s.sessao_uuid = %s
+            LIMIT 1{lock_sql}
+            """,
+            (sessao_uuid,),
+        )
+        return cursor.fetchone()
+
+
+def _exigir_sessao_conn(
+    conn,
+    sessao_uuid: str,
+    perfis_permitidos: Optional[Set[str]] = None,
+):
+    sessao = _carregar_sessao_conn(conn, sessao_uuid)
+
+    if not sessao:
+        raise HTTPException(status_code=401, detail="Sessão inválida")
+
+    if _norm_text(sessao.get("status")).upper() != "ATIVA":
+        raise HTTPException(status_code=401, detail="Sessão encerrada ou expirada")
+
+    perfil = _normalizar_perfil(sessao.get("colaborador"))
+    sessao["perfil"] = perfil
+    sessao["colaborador"] = perfil
+
+    if perfis_permitidos and perfil not in perfis_permitidos:
+        raise HTTPException(status_code=403, detail="Acesso não autorizado")
+
+    return sessao
+
+
+def _exigir_sessao_header(
+    x_session_uuid: Optional[str],
+    perfis_permitidos: Optional[Set[str]] = None,
+):
+    sessao_uuid = _get_session_uuid(header_value=x_session_uuid)
+    conn, _ = _open_db("app_sessoes")
+
+    try:
+        return _exigir_sessao_conn(conn, sessao_uuid, perfis_permitidos)
+    finally:
+        conn.close()
+
+
+def _registrar_atividade_conn(
+    conn,
+    *,
+    sessao_uuid: str,
+    id_usuario: int,
+    tipo_evento: str,
+    tela: Optional[str] = None,
+    referencia_id: Optional[str] = None,
+    detalhes: Any = None,
+):
+    detalhes_json = None
+    if detalhes is not None:
+        detalhes_json = json.dumps(
+            detalhes,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO app_atividades (
+                sessao_uuid,
+                id_usuario,
+                tipo_evento,
+                tela,
+                referencia_id,
+                detalhes,
+                ocorrido_em
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                sessao_uuid,
+                id_usuario,
+                tipo_evento,
+                tela,
+                referencia_id,
+                detalhes_json,
+            ),
+        )
+
+
+def _atualizar_heartbeat_conn(
+    conn,
+    *,
+    sessao_uuid: str,
+    em_atividade: bool,
+):
+    sessao = _carregar_sessao_conn(conn, sessao_uuid, for_update=True)
+
+    if not sessao:
+        raise HTTPException(status_code=401, detail="Sessão inválida")
+
+    if _norm_text(sessao.get("status")).upper() != "ATIVA":
+        raise HTTPException(status_code=409, detail="Sessão não está ativa")
+
+    intervalo = max(0, _norm_int(sessao.get("intervalo_heartbeat"), 0) or 0)
+
+    # Um intervalo grande normalmente significa aplicativo pausado, fechado
+    # ou sem rede. Nesse caso, esse período não entra como tempo ativo.
+    segundos_contabilizados = (
+        intervalo if intervalo <= HEARTBEAT_TIMEOUT_SECONDS else 0
+    )
+
+    acrescimo_ativo = segundos_contabilizados if em_atividade else 0
+    acrescimo_inativo = segundos_contabilizados if not em_atividade else 0
+
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE app_sessoes
+            SET
+                ultimo_heartbeat = NOW(),
+                segundos_ativos = segundos_ativos + %s,
+                segundos_inativos = segundos_inativos + %s
+            WHERE sessao_uuid = %s
+            """,
+            (acrescimo_ativo, acrescimo_inativo, sessao_uuid),
+        )
+
+        cursor.execute(
+            """
+            SELECT
+                sessao_uuid,
+                id_usuario,
+                login_em,
+                ultimo_heartbeat,
+                segundos_ativos,
+                segundos_inativos,
+                status
+            FROM app_sessoes
+            WHERE sessao_uuid = %s
+            LIMIT 1
+            """,
+            (sessao_uuid,),
+        )
+        return cursor.fetchone()
+
+
+def _json_para_objeto(value: Any):
+    if value is None or isinstance(value, (dict, list, int, float, bool)):
+        return value
+
+    try:
+        return json.loads(str(value))
+    except Exception:
+        return value
 
 
 def _query_params_to_where(request: Request):
@@ -729,35 +974,113 @@ def historico_por_relacao(id_relacao: str):
 
 
 # =========================================================
-# LOG
+# LOG / USUÁRIOS
 # =========================================================
 @app.get("/log")
-def listar_log(request: Request):
-    return _select_all("log", request)
+def listar_log(
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+
+    conn, _ = _open_db("log")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, nome, login, colaborador
+                FROM log
+                ORDER BY nome, login
+                """
+            )
+            rows = cursor.fetchall()
+
+        for row in rows:
+            perfil = _normalizar_perfil(row.get("colaborador"))
+            row["colaborador"] = perfil
+            row["perfil"] = perfil
+
+        return rows
+    finally:
+        conn.close()
 
 
 @app.get("/log/{item_id}")
-def obter_log(item_id: int):
-    return _select_by_id("log", item_id)
+def obter_log(
+    item_id: int,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+
+    conn, _ = _open_db("log")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, nome, login, colaborador
+                FROM log
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (item_id,),
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Registro não encontrado")
+
+        perfil = _normalizar_perfil(row.get("colaborador"))
+        row["colaborador"] = perfil
+        row["perfil"] = perfil
+        return row
+    finally:
+        conn.close()
 
 
 @app.post("/log")
-def inserir_log(data: Dict[str, Any]):
-    return _insert_row("log", data)
+def inserir_log(
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+
+    payload = dict(_ensure_dict(data))
+    payload["colaborador"] = _normalizar_perfil(payload.get("colaborador"))
+    return _insert_row("log", payload)
 
 
 @app.put("/log/{item_id}")
-def atualizar_log(item_id: int, data: Dict[str, Any]):
-    return _update_row("log", item_id, data)
+def atualizar_log(
+    item_id: int,
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+
+    payload = dict(_ensure_dict(data))
+    if "colaborador" in payload:
+        payload["colaborador"] = _normalizar_perfil(payload.get("colaborador"))
+
+    return _update_row("log", item_id, payload)
 
 
 @app.delete("/log/{item_id}")
-def deletar_log(item_id: int):
+def deletar_log(
+    item_id: int,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao_admin = _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+
+    if int(sessao_admin.get("id_usuario")) == int(item_id):
+        raise HTTPException(
+            status_code=400,
+            detail="O administrador não pode excluir o próprio usuário durante a sessão",
+        )
+
     return _delete_row("log", item_id)
 
 
 # =========================================================
-# LOGIN
+# LOGIN / SESSÕES
 # =========================================================
 @app.post("/auth/login")
 def login(data: Dict[str, Any]):
@@ -767,12 +1090,16 @@ def login(data: Dict[str, Any]):
     if not login_user or not senha:
         raise HTTPException(status_code=400, detail="login e senha são obrigatórios")
 
+    plataforma = _norm_text(data.get("plataforma")) or None
+    dispositivo = _norm_text(data.get("dispositivo")) or None
+    versao_app = _norm_text(data.get("versao_app")) or None
+
     conn, _ = _open_db("log")
     try:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, nome, login
+                SELECT id, nome, login, colaborador
                 FROM log
                 WHERE login = %s AND senha = %s
                 LIMIT 1
@@ -784,7 +1111,632 @@ def login(data: Dict[str, Any]):
         if not user:
             raise HTTPException(status_code=401, detail="Usuário ou senha inválidos")
 
-        return {"status": "ok", "usuario": user}
+        perfil = _normalizar_perfil(user.get("colaborador"))
+        sessao_uuid = str(uuid.uuid4())
+
+        with conn.cursor() as cursor:
+            # Impede que sessões antigas do mesmo usuário permaneçam como ativas.
+            cursor.execute(
+                """
+                UPDATE app_sessoes
+                SET
+                    logout_em = COALESCE(ultimo_heartbeat, NOW()),
+                    status = 'EXPIRADA'
+                WHERE id_usuario = %s
+                  AND status = 'ATIVA'
+                """,
+                (user["id"],),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO app_sessoes (
+                    sessao_uuid,
+                    id_usuario,
+                    login_em,
+                    ultimo_heartbeat,
+                    segundos_ativos,
+                    segundos_inativos,
+                    plataforma,
+                    dispositivo,
+                    versao_app,
+                    status,
+                    criado_em
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    NOW(),
+                    NOW(),
+                    0,
+                    0,
+                    %s,
+                    %s,
+                    %s,
+                    'ATIVA',
+                    NOW()
+                )
+                """,
+                (
+                    sessao_uuid,
+                    user["id"],
+                    plataforma,
+                    dispositivo,
+                    versao_app,
+                ),
+            )
+
+        _registrar_atividade_conn(
+            conn,
+            sessao_uuid=sessao_uuid,
+            id_usuario=user["id"],
+            tipo_evento="LOGIN_REALIZADO",
+            tela="login",
+            detalhes={
+                "plataforma": plataforma,
+                "dispositivo": dispositivo,
+                "versao_app": versao_app,
+            },
+        )
+
+        conn.commit()
+
+        user["colaborador"] = perfil
+        user["perfil"] = perfil
+
+        return {
+            "status": "ok",
+            "usuario": user,
+            "sessao_uuid": sessao_uuid,
+            "sessao": {
+                "sessao_uuid": sessao_uuid,
+                "status": "ATIVA",
+            },
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/auth/me")
+def auth_me(
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao_uuid = _get_session_uuid(header_value=x_session_uuid)
+    conn, _ = _open_db("app_sessoes")
+
+    try:
+        sessao = _exigir_sessao_conn(conn, sessao_uuid)
+        return {
+            "status": "ok",
+            "usuario": {
+                "id": sessao.get("id_usuario"),
+                "nome": sessao.get("nome"),
+                "login": sessao.get("login"),
+                "colaborador": sessao.get("perfil"),
+                "perfil": sessao.get("perfil"),
+            },
+            "sessao": {
+                "sessao_uuid": sessao.get("sessao_uuid"),
+                "login_em": sessao.get("login_em"),
+                "ultimo_heartbeat": sessao.get("ultimo_heartbeat"),
+                "segundos_ativos": sessao.get("segundos_ativos"),
+                "segundos_inativos": sessao.get("segundos_inativos"),
+                "status": sessao.get("status"),
+            },
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/auth/heartbeat")
+def heartbeat(
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao_uuid = _get_session_uuid(data, x_session_uuid)
+    em_atividade = _norm_bool(data.get("em_atividade"), True)
+
+    conn, _ = _open_db("app_sessoes")
+    try:
+        resultado = _atualizar_heartbeat_conn(
+            conn,
+            sessao_uuid=sessao_uuid,
+            em_atividade=em_atividade,
+        )
+        conn.commit()
+
+        return {
+            "status": "ok",
+            "sessao": resultado,
+            "em_atividade": em_atividade,
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/auth/logout")
+def logout(
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao_uuid = _get_session_uuid(data, x_session_uuid)
+    em_atividade = _norm_bool(data.get("em_atividade"), True)
+
+    conn, _ = _open_db("app_sessoes")
+    try:
+        sessao = _carregar_sessao_conn(conn, sessao_uuid, for_update=True)
+        if not sessao:
+            raise HTTPException(status_code=401, detail="Sessão inválida")
+
+        if _norm_text(sessao.get("status")).upper() != "ATIVA":
+            return {"status": "ok", "message": "Sessão já estava encerrada"}
+
+        intervalo = max(0, _norm_int(sessao.get("intervalo_heartbeat"), 0) or 0)
+        contabilizado = intervalo if intervalo <= HEARTBEAT_TIMEOUT_SECONDS else 0
+        acrescimo_ativo = contabilizado if em_atividade else 0
+        acrescimo_inativo = contabilizado if not em_atividade else 0
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE app_sessoes
+                SET
+                    logout_em = NOW(),
+                    ultimo_heartbeat = NOW(),
+                    segundos_ativos = segundos_ativos + %s,
+                    segundos_inativos = segundos_inativos + %s,
+                    status = 'ENCERRADA'
+                WHERE sessao_uuid = %s
+                """,
+                (acrescimo_ativo, acrescimo_inativo, sessao_uuid),
+            )
+
+        _registrar_atividade_conn(
+            conn,
+            sessao_uuid=sessao_uuid,
+            id_usuario=sessao["id_usuario"],
+            tipo_evento="LOGOUT_REALIZADO",
+            tela=_norm_text(data.get("tela")) or None,
+        )
+
+        conn.commit()
+        return {"status": "ok", "message": "Sessão encerrada"}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# =========================================================
+# ATIVIDADES DO APP
+# =========================================================
+@app.post("/atividades")
+def registrar_atividade(
+    data: Dict[str, Any],
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao_uuid = _get_session_uuid(data, x_session_uuid)
+    tipo_evento = _norm_text(data.get("tipo_evento")).upper()
+    tela = _norm_text(data.get("tela")) or None
+    referencia_id = _norm_text(data.get("referencia_id")) or None
+    detalhes = data.get("detalhes")
+
+    if not tipo_evento:
+        raise HTTPException(status_code=400, detail="tipo_evento é obrigatório")
+    if len(tipo_evento) > 60:
+        raise HTTPException(status_code=400, detail="tipo_evento excede 60 caracteres")
+    if tela and len(tela) > 80:
+        raise HTTPException(status_code=400, detail="tela excede 80 caracteres")
+    if referencia_id and len(referencia_id) > 100:
+        raise HTTPException(status_code=400, detail="referencia_id excede 100 caracteres")
+
+    conn, _ = _open_db("app_atividades")
+    try:
+        sessao = _exigir_sessao_conn(conn, sessao_uuid)
+
+        _atualizar_heartbeat_conn(
+            conn,
+            sessao_uuid=sessao_uuid,
+            em_atividade=True,
+        )
+
+        _registrar_atividade_conn(
+            conn,
+            sessao_uuid=sessao_uuid,
+            id_usuario=sessao["id_usuario"],
+            tipo_evento=tipo_evento,
+            tela=tela,
+            referencia_id=referencia_id,
+            detalhes=detalhes,
+        )
+
+        conn.commit()
+        return {"status": "ok"}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+# =========================================================
+# PAINEL DE PRODUTIVIDADE
+# =========================================================
+@app.get("/produtividade/painel")
+def painel_produtividade(
+    data_ref: Optional[str] = None,
+    incluir_gestao: bool = False,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao_uuid = _get_session_uuid(header_value=x_session_uuid)
+    data_consulta = _parse_data_ref(data_ref)
+
+    conn, _ = _open_db("app_sessoes")
+    try:
+        solicitante = _exigir_sessao_conn(conn, sessao_uuid, PERFIS_GESTAO)
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT CURDATE() AS hoje, NOW() AS agora")
+            relogio = cursor.fetchone()
+
+        if data_consulta is None:
+            data_consulta = relogio["hoje"]
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    l.id AS id_usuario,
+                    l.nome,
+                    l.login,
+                    l.colaborador,
+
+                    s.primeiro_login,
+                    s.ultimo_login,
+                    s.ultima_presenca,
+                    s.ultimo_heartbeat_ativo,
+                    COALESCE(s.tem_sessao_ativa, 0) AS tem_sessao_ativa,
+                    COALESCE(s.quantidade_sessoes, 0) AS quantidade_sessoes,
+                    COALESCE(s.segundos_ativos, 0) AS segundos_ativos,
+                    COALESCE(s.segundos_inativos, 0) AS segundos_inativos,
+
+                    a.ultima_acao,
+                    a.ultima_acao_produtiva,
+                    COALESCE(a.total_atividades, 0) AS total_atividades,
+                    COALESCE(a.auditorias_realizadas, 0) AS auditorias_realizadas,
+                    COALESCE(a.posicoes_verificadas, 0) AS posicoes_verificadas,
+                    COALESCE(a.divergencias_registradas, 0) AS divergencias_registradas,
+                    COALESCE(a.itens_inseridos, 0) AS itens_inseridos,
+                    COALESCE(a.itens_editados, 0) AS itens_editados,
+                    COALESCE(a.itens_excluidos, 0) AS itens_excluidos
+
+                FROM log l
+
+                LEFT JOIN (
+                    SELECT
+                        id_usuario,
+                        MIN(login_em) AS primeiro_login,
+                        MAX(login_em) AS ultimo_login,
+                        MAX(COALESCE(ultimo_heartbeat, logout_em, login_em)) AS ultima_presenca,
+                        MAX(CASE WHEN status = 'ATIVA' THEN ultimo_heartbeat END) AS ultimo_heartbeat_ativo,
+                        MAX(CASE WHEN status = 'ATIVA' THEN 1 ELSE 0 END) AS tem_sessao_ativa,
+                        COUNT(*) AS quantidade_sessoes,
+                        SUM(segundos_ativos) AS segundos_ativos,
+                        SUM(segundos_inativos) AS segundos_inativos
+                    FROM app_sessoes
+                    WHERE login_em >= %s
+                      AND login_em < DATE_ADD(%s, INTERVAL 1 DAY)
+                    GROUP BY id_usuario
+                ) s ON s.id_usuario = l.id
+
+                LEFT JOIN (
+                    SELECT
+                        id_usuario,
+                        MAX(ocorrido_em) AS ultima_acao,
+                        MAX(
+                            CASE
+                                WHEN tipo_evento NOT IN (
+                                    'LOGIN_REALIZADO',
+                                    'LOGOUT_REALIZADO',
+                                    'SESSAO_EXPIRADA',
+                                    'APP_ABERTO',
+                                    'APP_PAUSADO'
+                                )
+                                THEN ocorrido_em
+                            END
+                        ) AS ultima_acao_produtiva,
+                        COUNT(*) AS total_atividades,
+                        SUM(CASE WHEN tipo_evento = 'AUDITORIA_FINALIZADA' THEN 1 ELSE 0 END) AS auditorias_realizadas,
+                        SUM(CASE WHEN tipo_evento = 'POSICAO_VERIFICADA' THEN 1 ELSE 0 END) AS posicoes_verificadas,
+                        SUM(CASE WHEN tipo_evento = 'DIVERGENCIA_REGISTRADA' THEN 1 ELSE 0 END) AS divergencias_registradas,
+                        SUM(CASE WHEN tipo_evento = 'ITEM_INSERIDO' THEN 1 ELSE 0 END) AS itens_inseridos,
+                        SUM(CASE WHEN tipo_evento = 'ITEM_EDITADO' THEN 1 ELSE 0 END) AS itens_editados,
+                        SUM(CASE WHEN tipo_evento = 'ITEM_EXCLUIDO' THEN 1 ELSE 0 END) AS itens_excluidos
+                    FROM app_atividades
+                    WHERE ocorrido_em >= %s
+                      AND ocorrido_em < DATE_ADD(%s, INTERVAL 1 DAY)
+                    GROUP BY id_usuario
+                ) a ON a.id_usuario = l.id
+
+                ORDER BY
+                    CASE WHEN s.primeiro_login IS NULL THEN 1 ELSE 0 END,
+                    s.primeiro_login,
+                    l.nome
+                """,
+                (
+                    data_consulta,
+                    data_consulta,
+                    data_consulta,
+                    data_consulta,
+                ),
+            )
+            rows = cursor.fetchall()
+
+        hoje = relogio["hoje"]
+        agora = relogio["agora"]
+        colaboradores = []
+
+        for row in rows:
+            perfil = _normalizar_perfil(row.get("colaborador"))
+            if not incluir_gestao and perfil != "colaborador":
+                continue
+
+            primeiro_login = row.get("primeiro_login")
+            status_atual = "NAO_ENTROU"
+
+            if primeiro_login is not None:
+                if data_consulta != hoje:
+                    status_atual = "FINALIZADO"
+                else:
+                    heartbeat = row.get("ultimo_heartbeat_ativo")
+                    sessao_ativa = bool(row.get("tem_sessao_ativa"))
+
+                    if sessao_ativa and heartbeat is not None:
+                        atraso_heartbeat = max(
+                            0,
+                            int((agora - heartbeat).total_seconds()),
+                        )
+
+                        if atraso_heartbeat <= HEARTBEAT_TIMEOUT_SECONDS:
+                            ultima_produtiva = row.get("ultima_acao_produtiva")
+                            if ultima_produtiva is not None:
+                                atraso_produtivo = max(
+                                    0,
+                                    int((agora - ultima_produtiva).total_seconds()),
+                                )
+                            else:
+                                atraso_produtivo = HEARTBEAT_TIMEOUT_SECONDS + 1
+
+                            status_atual = (
+                                "ATIVO"
+                                if atraso_produtivo <= HEARTBEAT_TIMEOUT_SECONDS
+                                else "INATIVO"
+                            )
+                        else:
+                            status_atual = "OFFLINE"
+                    else:
+                        status_atual = "OFFLINE"
+
+            row["colaborador"] = perfil
+            row["perfil"] = perfil
+            row["status_atual"] = status_atual
+            row["alteracoes_realizadas"] = (
+                int(row.get("itens_inseridos") or 0)
+                + int(row.get("itens_editados") or 0)
+                + int(row.get("itens_excluidos") or 0)
+            )
+            colaboradores.append(row)
+
+        resumo = {
+            "total_colaboradores": len(colaboradores),
+            "colaboradores_logados": sum(
+                1 for item in colaboradores if item.get("primeiro_login") is not None
+            ),
+            "nao_entraram": sum(
+                1 for item in colaboradores if item.get("status_atual") == "NAO_ENTROU"
+            ),
+            "ativos": sum(
+                1 for item in colaboradores if item.get("status_atual") == "ATIVO"
+            ),
+            "inativos": sum(
+                1 for item in colaboradores if item.get("status_atual") == "INATIVO"
+            ),
+            "offline": sum(
+                1 for item in colaboradores if item.get("status_atual") == "OFFLINE"
+            ),
+            "segundos_ativos": sum(
+                int(item.get("segundos_ativos") or 0) for item in colaboradores
+            ),
+            "segundos_inativos": sum(
+                int(item.get("segundos_inativos") or 0) for item in colaboradores
+            ),
+            "auditorias_realizadas": sum(
+                int(item.get("auditorias_realizadas") or 0) for item in colaboradores
+            ),
+            "posicoes_verificadas": sum(
+                int(item.get("posicoes_verificadas") or 0) for item in colaboradores
+            ),
+            "divergencias_registradas": sum(
+                int(item.get("divergencias_registradas") or 0) for item in colaboradores
+            ),
+            "alteracoes_realizadas": sum(
+                int(item.get("alteracoes_realizadas") or 0) for item in colaboradores
+            ),
+        }
+
+        return {
+            "status": "ok",
+            "data_ref": data_consulta,
+            "solicitante": {
+                "id": solicitante.get("id_usuario"),
+                "nome": solicitante.get("nome"),
+                "perfil": solicitante.get("perfil"),
+            },
+            "resumo": resumo,
+            "colaboradores": colaboradores,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/produtividade/colaborador/{id_usuario}")
+def produtividade_colaborador(
+    id_usuario: int,
+    data_ref: Optional[str] = None,
+    limit_atividades: int = 500,
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    sessao_uuid = _get_session_uuid(header_value=x_session_uuid)
+    data_consulta = _parse_data_ref(data_ref)
+    limit_atividades, _ = _safe_limit_offset(
+        limit_atividades,
+        0,
+        default_limit=500,
+        max_limit=1000,
+    )
+
+    conn, _ = _open_db("app_sessoes")
+    try:
+        _exigir_sessao_conn(conn, sessao_uuid, PERFIS_GESTAO)
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT CURDATE() AS hoje")
+            hoje = cursor.fetchone()["hoje"]
+
+        if data_consulta is None:
+            data_consulta = hoje
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, nome, login, colaborador
+                FROM log
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (id_usuario,),
+            )
+            usuario = cursor.fetchone()
+
+        if not usuario:
+            raise HTTPException(status_code=404, detail="Colaborador não encontrado")
+
+        perfil = _normalizar_perfil(usuario.get("colaborador"))
+        usuario["colaborador"] = perfil
+        usuario["perfil"] = perfil
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    sessao_uuid,
+                    login_em,
+                    logout_em,
+                    ultimo_heartbeat,
+                    segundos_ativos,
+                    segundos_inativos,
+                    plataforma,
+                    dispositivo,
+                    versao_app,
+                    status,
+                    criado_em
+                FROM app_sessoes
+                WHERE id_usuario = %s
+                  AND login_em >= %s
+                  AND login_em < DATE_ADD(%s, INTERVAL 1 DAY)
+                ORDER BY login_em DESC
+                """,
+                (id_usuario, data_consulta, data_consulta),
+            )
+            sessoes = cursor.fetchall()
+
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    sessao_uuid,
+                    tipo_evento,
+                    tela,
+                    referencia_id,
+                    detalhes,
+                    ocorrido_em
+                FROM app_atividades
+                WHERE id_usuario = %s
+                  AND ocorrido_em >= %s
+                  AND ocorrido_em < DATE_ADD(%s, INTERVAL 1 DAY)
+                ORDER BY ocorrido_em DESC
+                LIMIT %s
+                """,
+                (
+                    id_usuario,
+                    data_consulta,
+                    data_consulta,
+                    limit_atividades,
+                ),
+            )
+            atividades = cursor.fetchall()
+
+        for atividade in atividades:
+            atividade["detalhes"] = _json_para_objeto(atividade.get("detalhes"))
+
+        contagem_tipos: Dict[str, int] = {}
+        for atividade in atividades:
+            tipo = _norm_text(atividade.get("tipo_evento")).upper()
+            contagem_tipos[tipo] = contagem_tipos.get(tipo, 0) + 1
+
+        resumo = {
+            "primeiro_login": min(
+                (s.get("login_em") for s in sessoes if s.get("login_em") is not None),
+                default=None,
+            ),
+            "ultima_atividade": max(
+                (
+                    a.get("ocorrido_em")
+                    for a in atividades
+                    if a.get("ocorrido_em") is not None
+                ),
+                default=None,
+            ),
+            "quantidade_sessoes": len(sessoes),
+            "segundos_ativos": sum(int(s.get("segundos_ativos") or 0) for s in sessoes),
+            "segundos_inativos": sum(int(s.get("segundos_inativos") or 0) for s in sessoes),
+            "total_atividades": len(atividades),
+            "auditorias_realizadas": contagem_tipos.get("AUDITORIA_FINALIZADA", 0),
+            "posicoes_verificadas": contagem_tipos.get("POSICAO_VERIFICADA", 0),
+            "divergencias_registradas": contagem_tipos.get("DIVERGENCIA_REGISTRADA", 0),
+            "itens_inseridos": contagem_tipos.get("ITEM_INSERIDO", 0),
+            "itens_editados": contagem_tipos.get("ITEM_EDITADO", 0),
+            "itens_excluidos": contagem_tipos.get("ITEM_EXCLUIDO", 0),
+        }
+
+        return {
+            "status": "ok",
+            "data_ref": data_consulta,
+            "usuario": usuario,
+            "resumo": resumo,
+            "sessoes": sessoes,
+            "atividades": atividades,
+        }
     finally:
         conn.close()
 
