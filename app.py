@@ -17,14 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="API Base Ambev", version="6.4.0")
 fastapi_app = app  # alias mantido apenas para compatibilidade local
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.options("/{full_path:path}")
 async def preflight_handler(full_path: str):
     return Response(
@@ -75,8 +67,22 @@ async def selecionar_operacao(request: Request, call_next):
         return await call_next(request)
     except HTTPException as exc:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    except Exception as exc:
+        # Devolve JSON com CORS mesmo em falhas inesperadas no teste.
+        print("Falha nao tratada na API:", type(exc).__name__, str(exc))
+        return JSONResponse(status_code=500, content={"detail": "Erro interno no servidor. Consulte os logs da API."})
     finally:
         _OPERACAO_ATUAL.reset(token)
+
+# CORS deve ficar POR FORA do middleware de autorizacao para que
+# respostas 401/403/500 tambem cheguem ao Flutter Web, sem Failed to fetch.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # =========================================================
 # TABLES
