@@ -557,6 +557,43 @@ def _select_by_id(table_name: str, item_id: int):
         conn.close()
 
 
+def _colunas_gravaveis(conn, table_name: str) -> dict:
+    """Leitura do esquema existente. Nao executa DDL ou migracoes."""
+    if table_name not in TABLES:
+        raise HTTPException(status_code=404, detail="Tabela desconhecida")
+    with conn.cursor() as cursor:
+        cursor.execute(f"SHOW FULL COLUMNS FROM `{table_name}`")
+        rows = cursor.fetchall()
+    if not rows:
+        raise HTTPException(status_code=500, detail="Esquema da tabela indisponivel")
+    return {
+        str(row["Field"]).lower(): str(row["Field"])
+        for row in rows
+        if "GENERATED" not in str(row.get("Extra") or "").upper()
+    }
+
+
+def _ajustar_escrita_cliente(conn, table_name: str, data: dict) -> dict:
+    """Somente Heineken: adaptar colunas da API ao esquema atual do banco."""
+    if _OPERACAO_ATUAL.get() != "teste_shelf":
+        return data
+    gravaveis = _colunas_gravaveis(conn, table_name)
+    ajustado = {}
+    descartadas = []
+    for coluna, valor in data.items():
+        nome_banco = gravaveis.get(str(coluna).lower())
+        if nome_banco:
+            if nome_banco.lower() not in {"id"}:
+                ajustado[nome_banco] = valor
+        else:
+            descartadas.append(str(coluna))
+    if descartadas:
+        print(f"[teste_shelf] {table_name}: campos nao gravaveis ignorados: {', '.join(descartadas)}")
+    if not ajustado:
+        raise HTTPException(status_code=400, detail="Nenhum campo gravavel recebido")
+    return ajustado
+
+
 def _insert_row(table_name: str, data: Dict[str, Any]):
     conn, _ = _open_db(table_name)
 
@@ -569,6 +606,7 @@ def _insert_row(table_name: str, data: Dict[str, Any]):
             if data.get("USUARIO_SISTEMA") is not None:
                 data["USUARIO_SISTEMA"] = str(data["USUARIO_SISTEMA"])[:40]
 
+        data = _ajustar_escrita_cliente(conn, table_name, data)
         cols = list(data.keys())
         fields_sql = ", ".join(f"`{c}`" for c in cols)
         placeholders = ", ".join(["%s"] * len(cols))
@@ -588,7 +626,8 @@ def _insert_row(table_name: str, data: Dict[str, Any]):
         raise
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[SQL INSERT] {table_name} / {_OPERACAO_ATUAL.get()}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Falha ao inserir registro")
     finally:
         conn.close()
 
@@ -609,6 +648,7 @@ def _update_row(table_name: str, item_id: int, data: Dict[str, Any]):
             if not cursor.fetchone():
                 raise HTTPException(status_code=404, detail="Registro não encontrado")
 
+            data = _ajustar_escrita_cliente(conn, table_name, data)
             cols = list(data.keys())
             set_sql = ", ".join(f"`{c}` = %s" for c in cols)
             values = [data[c] for c in cols]
@@ -626,7 +666,8 @@ def _update_row(table_name: str, item_id: int, data: Dict[str, Any]):
         raise
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[SQL UPDATE] {table_name} / {_OPERACAO_ATUAL.get()}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Falha ao atualizar registro")
     finally:
         conn.close()
 
@@ -655,7 +696,8 @@ def _delete_row(table_name: str, item_id: int):
         raise
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[SQL DELETE] {table_name} / {_OPERACAO_ATUAL.get()}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Falha ao excluir registro")
     finally:
         conn.close()
 
@@ -758,8 +800,20 @@ def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None
         if qtd_plt is None:
             raise HTTPException(status_code=400, detail="Campo QUANTIDADE_PLT é obrigatório")
 
-        packs = _get_produto_packs(produto)
-        merged["QUANTIDADE_PACK"] = int(qtd_plt) * int(packs)
+        # Na Heineken, edicoes de observacao, situacao, lote ou area
+        # nao precisam consultar produtos nem recalcular PACKS quando
+        # o SKU e a quantidade de paletes permaneceram iguais.
+        precisa_recalcular_packs = (
+            _OPERACAO_ATUAL.get() != "teste_shelf"
+            or base_row is None
+            or produto != _norm_text(base_row.get("PRODUTO"))
+            or qtd_plt != _norm_int(base_row.get("QUANTIDADE_PLT"))
+        )
+        if precisa_recalcular_packs:
+            packs = _get_produto_packs(produto)
+            merged["QUANTIDADE_PACK"] = int(qtd_plt) * int(packs)
+        else:
+            merged["QUANTIDADE_PACK"] = base_row.get("QUANTIDADE_PACK")
 
         if not _norm_text(merged.get("CHECKLIST_MASTER")):
             merged["CHECKLIST_MASTER"] = "[00000]"
@@ -771,17 +825,14 @@ def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None
         merged.pop("DATA_VALIDADE", None)
 
         if _OPERACAO_ATUAL.get() == "teste_shelf":
-            if "usuario_app" in payload:
-                with conn.cursor() as cursor:
-                    cursor.execute("SHOW COLUMNS FROM estoque LIKE 'usuario_app'")
-                    if not cursor.fetchone():
-                        payload.pop("usuario_app", None)
+            # O schema real e consultado por _ajustar_escrita_cliente no INSERT/UPDATE.
+            # Nunca exigir colunas novas e nunca modificar a estrutura MySQL.
             payload.pop("SITUACAO3", None)
             payload.pop("situacao3", None)
             payload.pop("QUANTIDADE_PACK", None)
             if item_id is not None:
                 # PATCH parcial preserva campos shelf e checklist da base.
-                if "PRODUTO" in payload or "QUANTIDADE_PLT" in payload:
+                if precisa_recalcular_packs:
                     payload["QUANTIDADE_PACK"] = merged["QUANTIDADE_PACK"]
                 return payload
             payload["QUANTIDADE_PACK"] = merged["QUANTIDADE_PACK"]
