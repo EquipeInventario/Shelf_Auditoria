@@ -3,6 +3,7 @@ import os
 import uuid
 from contextvars import ContextVar
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, Optional, Set
 
 import pymysql
@@ -69,8 +70,17 @@ async def selecionar_operacao(request: Request, call_next):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     except Exception as exc:
         # Devolve JSON com CORS mesmo em falhas inesperadas no teste.
-        print("Falha nao tratada na API:", type(exc).__name__, str(exc))
-        return JSONResponse(status_code=500, content={"detail": "Erro interno no servidor. Consulte os logs da API."})
+        import traceback
+        print(
+            f"[API][{operacao}][{request.method} {request.url.path}] "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Não foi possível concluir a operação."},
+        )
     finally:
         _OPERACAO_ATUAL.reset(token)
 
@@ -160,7 +170,7 @@ def _norm_int(value: Any, default: Optional[int] = None) -> Optional[int]:
         return default
     if isinstance(value, int):
         return value
-    if isinstance(value, float):
+    if isinstance(value, (float, Decimal)):
         return int(value)
 
     text = str(value).strip()
@@ -711,34 +721,53 @@ def _fetch_produto_row(conn, produto: str):
         return None
 
     with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT
-                ID,
-                PRODUTO,
-                DESCRICAO,
-                ABREVIACAO,
-                SHELF,
-                VALIDADE_DIAS,
-                PACKS,
-                exigeFornecedor,
-                exigeLote,
-                tipo_produto,
-                exigeLinha,
-                exigeDocExtra
-            FROM produtos
-            WHERE PRODUTO = %s
-            LIMIT 1
-            """,
-            (produto,),
-        )
+        if _OPERACAO_ATUAL.get() == "teste_shelf":
+            # A base Heineken nao possui todas as colunas da Ambev
+            # (por exemplo, exigeLinha). SELECT * usa o esquema existente.
+            cursor.execute(
+                "SELECT * FROM produtos WHERE PRODUTO = %s LIMIT 1",
+                (produto,),
+            )
+        else:
+            # Preservar integralmente o contrato atual da Ambev.
+            cursor.execute(
+                """
+                SELECT
+                    ID,
+                    PRODUTO,
+                    DESCRICAO,
+                    ABREVIACAO,
+                    SHELF,
+                    VALIDADE_DIAS,
+                    PACKS,
+                    exigeFornecedor,
+                    exigeLote,
+                    tipo_produto,
+                    exigeLinha,
+                    exigeDocExtra
+                FROM produtos
+                WHERE PRODUTO = %s
+                LIMIT 1
+                """,
+                (produto,),
+            )
         return cursor.fetchone()
 
 
 def _get_produto_packs(produto: str) -> int:
     conn, _ = _open_db("produtos")
     try:
-        row = _fetch_produto_row(conn, produto)
+        if _OPERACAO_ATUAL.get() == "teste_shelf":
+            # Calcular PACKS usando somente os campos realmente necessarios.
+            # Evita depender de colunas opcionais do cadastro de produtos.
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT PRODUTO, PACKS FROM produtos WHERE PRODUTO = %s LIMIT 1",
+                    (produto,),
+                )
+                row = cursor.fetchone()
+        else:
+            row = _fetch_produto_row(conn, produto)
         if not row:
             raise HTTPException(status_code=404, detail=f"Produto não encontrado: {produto}")
 
@@ -754,7 +783,7 @@ def _get_produto_packs(produto: str) -> int:
 # =========================================================
 # ESTOQUE PAYLOAD
 # =========================================================
-def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None) -> Dict[str, Any]:
+def _preparar_estoque_ambev(data: Dict[str, Any], item_id: Optional[int] = None) -> Dict[str, Any]:
     payload = dict(data)
 
     payload.pop("SITUACAO3", None)
@@ -800,20 +829,8 @@ def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None
         if qtd_plt is None:
             raise HTTPException(status_code=400, detail="Campo QUANTIDADE_PLT é obrigatório")
 
-        # Na Heineken, edicoes de observacao, situacao, lote ou area
-        # nao precisam consultar produtos nem recalcular PACKS quando
-        # o SKU e a quantidade de paletes permaneceram iguais.
-        precisa_recalcular_packs = (
-            _OPERACAO_ATUAL.get() != "teste_shelf"
-            or base_row is None
-            or produto != _norm_text(base_row.get("PRODUTO"))
-            or qtd_plt != _norm_int(base_row.get("QUANTIDADE_PLT"))
-        )
-        if precisa_recalcular_packs:
-            packs = _get_produto_packs(produto)
-            merged["QUANTIDADE_PACK"] = int(qtd_plt) * int(packs)
-        else:
-            merged["QUANTIDADE_PACK"] = base_row.get("QUANTIDADE_PACK")
+        packs = _get_produto_packs(produto)
+        merged["QUANTIDADE_PACK"] = int(qtd_plt) * int(packs)
 
         if not _norm_text(merged.get("CHECKLIST_MASTER")):
             merged["CHECKLIST_MASTER"] = "[00000]"
@@ -824,24 +841,168 @@ def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None
         merged.pop("DATA_BLOQ", None)
         merged.pop("DATA_VALIDADE", None)
 
-        if _OPERACAO_ATUAL.get() == "teste_shelf":
-            # O schema real e consultado por _ajustar_escrita_cliente no INSERT/UPDATE.
-            # Nunca exigir colunas novas e nunca modificar a estrutura MySQL.
-            payload.pop("SITUACAO3", None)
-            payload.pop("situacao3", None)
-            payload.pop("QUANTIDADE_PACK", None)
-            if item_id is not None:
-                # PATCH parcial preserva campos shelf e checklist da base.
-                if precisa_recalcular_packs:
-                    payload["QUANTIDADE_PACK"] = merged["QUANTIDADE_PACK"]
-                return payload
-            payload["QUANTIDADE_PACK"] = merged["QUANTIDADE_PACK"]
-            payload["CHECKLIST_MASTER"] = merged["CHECKLIST_MASTER"]
-            return payload
-
         return merged
     finally:
         conn.close()
+
+
+# =========================================================
+# HEINEKEN - CONTRATO OPERACIONAL INDEPENDENTE DA AMBEV
+# =========================================================
+# Campos sao definidos pela auditoria Heineken, nao copiados do cadastro
+# de estoque Ambev. SHOW FULL COLUMNS e usado depois APENAS para verificar
+# se cada campo permitido existe e pode ser gravado, sem alterar o MySQL.
+HEINEKEN_ESTOQUE_CAMPOS = frozenset({
+    "PRODUTO", "lote", "linha", "AZ", "QD", "RUA", "AREA",
+    "QUANTIDADE_PLT", "DATA_FABRICACAO", "SITUACAO2",
+    "observacao", "DATA_HOJE", "CHECKLIST_MASTER",
+    "TIPO_PALLET", "DATA_RECEBIMENTO", "PROCEDENCIA", "NF",
+    "CONFERENTE", "OPERADOR",
+    "SHELF_DIAS", "VALIDADE_DIAS", "SITUACAO",
+})
+HEINEKEN_ESTOQUE_NUMERICOS = {"AZ", "RUA", "QUANTIDADE_PLT", "SHELF_DIAS", "VALIDADE_DIAS"}
+HEINEKEN_ESTOQUE_CAMPOS_CANONICOS = {
+    nome.lower(): nome for nome in HEINEKEN_ESTOQUE_CAMPOS
+}
+
+
+def _configuracao_produto_heineken(produto: str) -> Dict[str, int]:
+    # Cadastro proprio da Heineken: somente PACKS, SHELF, VALIDADE_DIAS,
+    # comprovadamente existentes em produtos. Nunca consultar exigeLinha.
+    conn, _ = _open_db("produtos")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT PACKS, SHELF, VALIDADE_DIAS FROM produtos "
+                "WHERE PRODUTO = %s LIMIT 1",
+                (produto,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Produto nao cadastrado")
+        packs = _norm_int(row.get("PACKS"))
+        if packs is None or packs <= 0:
+            raise HTTPException(status_code=400, detail="PACKS nao cadastrado")
+        return {
+            "PACKS": packs,
+            "SHELF": _norm_int(row.get("SHELF"), 0),
+            "VALIDADE_DIAS": _norm_int(row.get("VALIDADE_DIAS"), 0),
+        }
+    finally:
+        conn.close()
+
+
+def _defaults_obrigatorios_heineken(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Preenchimento automatico do cadastro Heineken, nao da Ambev.
+
+    Nao altera o banco. O INSERT filtra os campos pelo schema real.
+    Valores existentes e informados pelo usuario nunca sao substituidos.
+    """
+    agora = datetime.now().strftime("[%d-%m-%Y %H:%M:%S]")
+    situacao = _norm_text(payload.get("SITUACAO2")) or "LIBERADO"
+    defaults = {
+        "CHECKLIST_MASTER": "[00000]",
+        "TIPO_PALLET": "PADRÃO",
+        "DATA_RECEBIMENTO": agora,
+        "PROCEDENCIA": "PRODUÇÃO",
+        "NF": "[00000]",
+        "CONFERENTE": "[AJUSTE AUDITORIA]",
+        "OPERADOR": "[AJUSTE AUDITORIA]",
+        "SITUACAO": situacao,
+    }
+    preenchido = dict(payload)
+    for campo, valor in defaults.items():
+        if not _norm_text(preenchido.get(campo)):
+            preenchido[campo] = valor
+    return preenchido
+
+
+def _preparar_estoque_heineken(
+    data: Dict[str, Any],
+    item_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    origem = _ensure_dict(data)
+    payload: Dict[str, Any] = {}
+    ignorados = []
+
+    for chave, valor in origem.items():
+        campo = HEINEKEN_ESTOQUE_CAMPOS_CANONICOS.get(str(chave).lower())
+        if campo is None:
+            ignorados.append(str(chave))
+            continue
+        # Campos de shelf derivados do cadastro nao devem ser inventados.
+        # Somente aceitar valores de entrada declarados pelo cliente.
+        if campo in HEINEKEN_ESTOQUE_NUMERICOS:
+            if valor is None or str(valor).strip() == "":
+                valor = None
+            else:
+                numero = _norm_int(valor)
+                if numero is None:
+                    raise HTTPException(status_code=400, detail=f"Valor invalido em {campo}")
+                valor = numero
+        elif campo == "PRODUTO":
+            valor = _norm_text(valor)
+        payload[campo] = valor
+
+    if ignorados:
+        print("[Heineken] Campos de outro contrato ignorados: " + ", ".join(ignorados))
+
+    conn, _ = _open_db("estoque")
+    try:
+        anterior = None
+        if item_id is not None:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM estoque WHERE ID = %s LIMIT 1", (item_id,))
+                anterior = cursor.fetchone()
+            if not anterior:
+                raise HTTPException(status_code=404, detail="Registro nao encontrado")
+
+        produto = _norm_text(payload.get("PRODUTO", anterior.get("PRODUTO") if anterior else None))
+        quantidade = payload.get("QUANTIDADE_PLT",
+                                 _norm_int(anterior.get("QUANTIDADE_PLT")) if anterior else None)
+
+        if not produto:
+            raise HTTPException(status_code=400, detail="Produto obrigatorio")
+        if quantidade is None or quantidade < 0:
+            raise HTTPException(status_code=400, detail="Quantidade de paletes invalida")
+
+        # O controle de shelf pertence ao cadastro da Heineken. Sempre
+        # atualizar seus parametros quando o SKU for novo ou alterado.
+        alterou_produto = (
+            anterior is None or produto != _norm_text(anterior.get("PRODUTO"))
+        )
+        alterou_quantidade = (
+            anterior is None or quantidade != _norm_int(anterior.get("QUANTIDADE_PLT"))
+        )
+        if alterou_produto:
+            cadastro = _configuracao_produto_heineken(produto)
+            payload["SHELF_DIAS"] = cadastro["SHELF"]
+            payload["VALIDADE_DIAS"] = cadastro["VALIDADE_DIAS"]
+            payload["QUANTIDADE_PACK"] = quantidade * cadastro["PACKS"]
+        elif alterou_quantidade:
+            payload["QUANTIDADE_PACK"] = quantidade * _get_produto_packs(produto)
+
+        # Nao sobrescrever checklist existente. No cadastro sem checklist,
+        # usar o identificador convencionado para essa situacao.
+        if anterior is None:
+            # Colunas obrigatorias recebem defaults apenas no cadastro.
+            # O _ajustar_escrita_cliente verifica as colunas existentes
+            # na tabela real, sem exigir novos campos no banco.
+            payload = _defaults_obrigatorios_heineken(payload)
+
+        # Nunca enviar colunas calculadas (DATA_SHELF, DATA_BLOQ,
+        # DATA_VALIDADE, SITUACAO3). Nenhuma regra de ZI aqui.
+        return payload
+    finally:
+        conn.close()
+
+
+def _prepare_estoque_payload(
+    data: Dict[str, Any], item_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    if _OPERACAO_ATUAL.get() == "teste_shelf":
+        return _preparar_estoque_heineken(data, item_id=item_id)
+    return _preparar_estoque_ambev(data, item_id=item_id)
 
 
 # =========================================================
