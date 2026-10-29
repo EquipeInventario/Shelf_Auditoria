@@ -1,11 +1,14 @@
 import json
 import os
 import uuid
+from contextvars import ContextVar
 from datetime import date, datetime
 from typing import Any, Dict, Optional, Set
 
 import pymysql
 from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from fastapi.middleware.cors import CORSMiddleware
 
 # =========================================================
@@ -29,7 +32,7 @@ async def preflight_handler(full_path: str):
         headers={
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type,Accept,Authorization,X-Session-UUID",
+            "Access-Control-Allow-Headers": "Content-Type,Accept,Authorization,X-Session-UUID,X-Cliente-Operacao",
             "Access-Control-Max-Age": "86400",
         },
     )
@@ -43,7 +46,37 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 
 DB_NAME_BASE = os.getenv("DB_NAME_BASE", "base_ambev")
+DB_NAME_TESTE_SHELF = os.getenv("DB_NAME_TESTE_SHELF", "teste_shelf")
 DB_NAME_INVENTARIO = os.getenv("DB_NAME_INVENTARIO", "inventario")
+
+# Uma API, rotas operacionais separadas e bancos definidos no servidor.
+CLIENTES = {
+    "ambev": {"nome": "Ambev", "db": DB_NAME_BASE},
+    "teste_shelf": {"nome": "Teste Shelf", "db": DB_NAME_TESTE_SHELF},
+}
+_OPERACAO_ATUAL: ContextVar[str] = ContextVar("shelf_operacao", default="ambev")
+_TABELAS_OPERACIONAIS = frozenset({
+    "estoque", "historico_alteracoes", "historico_historico",
+    "historico_recebimento", "historico_expedicao", "produtos",
+})
+
+
+@app.middleware("http")
+async def selecionar_operacao(request: Request, call_next):
+    # As rotas antigas continuam exclusivas da Ambev.
+    # A operacao de teste possui rotas proprias: /teste-shelf/...
+    operacao = ("teste_shelf" if request.url.path.startswith("/teste-shelf/")
+                else "ambev")
+    token = _OPERACAO_ATUAL.set(operacao)
+    try:
+        if operacao == "teste_shelf" and request.method.upper() != "OPTIONS":
+            # Somente administradores podem testar a nova base nesta etapa.
+            _exigir_sessao_header(request.headers.get("X-Session-UUID"), PERFIS_ADMIN)
+        return await call_next(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    finally:
+        _OPERACAO_ATUAL.reset(token)
 
 # =========================================================
 # TABLES
@@ -90,6 +123,8 @@ def get_table_cfg(table_name: str):
     cfg = TABLES.get(table_name)
     if not cfg:
         raise HTTPException(status_code=404, detail="Tabela não suportada")
+    if table_name in _TABELAS_OPERACIONAIS:
+        return {**cfg, "db": CLIENTES[_OPERACAO_ATUAL.get()]["db"]}
     return cfg
 
 
@@ -308,6 +343,9 @@ def _registrar_atividade_conn(
     detalhes: Any = None,
 ):
     detalhes_json = None
+    if _OPERACAO_ATUAL.get() == "teste_shelf":
+        detalhes = {**(detalhes if isinstance(detalhes, dict) else {"conteudo": detalhes}),
+                    "cliente_operacao": "teste_shelf"}
     if detalhes is not None:
         detalhes_json = json.dumps(
             detalhes,
@@ -349,6 +387,10 @@ def _registrar_atividade_segura(
     detalhes: Any = None,
 ):
     """Registra atividade sem fazer a operação principal falhar."""
+    # A produtividade do cliente teste ainda nao possui isolamento por sessao.
+    # Nao misturar eventos de testes com indicadores reais da Ambev.
+    if _OPERACAO_ATUAL.get() == "teste_shelf":
+        return
     conn, _ = _open_db("app_atividades")
     try:
         _atualizar_heartbeat_conn(
@@ -516,6 +558,10 @@ def _insert_row(table_name: str, data: Dict[str, Any]):
         data = _ensure_dict(data)
         if not data:
             raise HTTPException(status_code=400, detail="Payload vazio")
+        if table_name == "historico_alteracoes" and _OPERACAO_ATUAL.get() == "teste_shelf":
+            data = dict(data)
+            if data.get("USUARIO_SISTEMA") is not None:
+                data["USUARIO_SISTEMA"] = str(data["USUARIO_SISTEMA"])[:40]
 
         cols = list(data.keys())
         fields_sql = ", ".join(f"`{c}`" for c in cols)
@@ -666,9 +712,7 @@ def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None
     payload.pop("SITUACAO3", None)
     payload.pop("situacao3", None)
 
-    if not _norm_text(payload.get("CHECKLIST_MASTER")):
-        payload["CHECKLIST_MASTER"] = "[00000]"
-
+    # Nao sobrescrever checklist existente ao editar.
     if "PRODUTO" in payload:
         payload["PRODUTO"] = _norm_text(payload["PRODUTO"])
     if "lote" in payload:
@@ -720,6 +764,24 @@ def _prepare_estoque_payload(data: Dict[str, Any], item_id: Optional[int] = None
         merged.pop("DATA_BLOQ", None)
         merged.pop("DATA_VALIDADE", None)
 
+        if _OPERACAO_ATUAL.get() == "teste_shelf":
+            if "usuario_app" in payload:
+                with conn.cursor() as cursor:
+                    cursor.execute("SHOW COLUMNS FROM estoque LIKE 'usuario_app'")
+                    if not cursor.fetchone():
+                        payload.pop("usuario_app", None)
+            payload.pop("SITUACAO3", None)
+            payload.pop("situacao3", None)
+            payload.pop("QUANTIDADE_PACK", None)
+            if item_id is not None:
+                # PATCH parcial preserva campos shelf e checklist da base.
+                if "PRODUTO" in payload or "QUANTIDADE_PLT" in payload:
+                    payload["QUANTIDADE_PACK"] = merged["QUANTIDADE_PACK"]
+                return payload
+            payload["QUANTIDADE_PACK"] = merged["QUANTIDADE_PACK"]
+            payload["CHECKLIST_MASTER"] = merged["CHECKLIST_MASTER"]
+            return payload
+
         return merged
     finally:
         conn.close()
@@ -740,6 +802,33 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/clientes")
+def listar_clientes_configurados(
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+    return [{"id": codigo, "nome": cfg["nome"]} for codigo, cfg in CLIENTES.items()]
+
+
+@app.get("/teste-shelf/validar")
+def validar_operacao(
+    x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+):
+    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+    tabelas = ("estoque", "produtos", "historico_alteracoes")
+    for tabela in tabelas:
+        conn, _ = _open_db(tabela)
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT 1 FROM `{tabela}` LIMIT 1")
+        finally:
+            conn.close()
+    return {
+        "status": "ok", "cliente": _OPERACAO_ATUAL.get(),
+        "tabelas_verificadas": list(tabelas),
+    }
 
 
 # =========================================================
@@ -1536,6 +1625,11 @@ def registrar_atividade(
     referencia_id = _norm_text(data.get("referencia_id")) or None
     detalhes = data.get("detalhes")
 
+    if _norm_text(data.get("cliente_operacao")) == "teste_shelf":
+        # Testes sao isolados do painel de produtividade da Ambev.
+        _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+        return {"status": "ok", "detalhe": "atividade de teste nao contabilizada"}
+
     if not tipo_evento:
         raise HTTPException(status_code=400, detail="tipo_evento é obrigatório")
     if len(tipo_evento) > 60:
@@ -1586,6 +1680,8 @@ def painel_produtividade(
     incluir_gestao: bool = False,
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
+    if _OPERACAO_ATUAL.get() == "teste_shelf":
+        raise HTTPException(status_code=409, detail="Produtividade teste_shelf ainda nao habilitada: separacao de atividades pendente")
     sessao_uuid = _get_session_uuid(header_value=x_session_uuid)
     data_consulta = _parse_data_ref(data_ref)
 
@@ -1818,6 +1914,8 @@ def produtividade_colaborador(
     limit_atividades: int = 500,
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
+    if _OPERACAO_ATUAL.get() == "teste_shelf":
+        raise HTTPException(status_code=409, detail="Produtividade teste_shelf ainda nao habilitada: separacao de atividades pendente")
     sessao_uuid = _get_session_uuid(header_value=x_session_uuid)
     data_consulta = _parse_data_ref(data_ref)
     limit_atividades, _ = _safe_limit_offset(
@@ -2107,3 +2205,28 @@ def historico_expedicao_por_checklist(checklist: str):
             return cursor.fetchall()
     finally:
         conn.close()
+# =========================================================
+# TESTE SHELF: MESMA API, ENDPOINTS EXCLUSIVOS
+# =========================================================
+# O mobile inventario_app usa este mesmo principio (rotas distintas por
+# operacao). Mantemos os endpoints originais imutaveis para a Ambev.
+_PREFIXOS_OPERACIONAIS = (
+    "/estoque", "/produtos", "/historico", "/historico-historico",
+    "/historico-recebimento", "/historico-expedicao",
+)
+_rotas_ambev = list(app.routes)
+for _rota in _rotas_ambev:
+    if not isinstance(_rota, APIRoute):
+        continue
+    if not any(
+        _rota.path == prefix or _rota.path.startswith(prefix + "/")
+        for prefix in _PREFIXOS_OPERACIONAIS
+    ):
+        continue
+    app.add_api_route(
+        "/teste-shelf" + _rota.path,
+        _rota.endpoint,
+        methods=sorted(_rota.methods or {"GET"}),
+        name=_rota.name + "_teste_shelf",
+        include_in_schema=False,
+    )
