@@ -853,7 +853,7 @@ def _preparar_estoque_ambev(data: Dict[str, Any], item_id: Optional[int] = None)
 # de estoque Ambev. SHOW FULL COLUMNS e usado depois APENAS para verificar
 # se cada campo permitido existe e pode ser gravado, sem alterar o MySQL.
 HEINEKEN_ESTOQUE_CAMPOS = frozenset({
-    "PRODUTO", "lote", "linha", "AZ", "QD", "RUA", "AREA",
+    "PRODUTO", "AZ", "QD", "RUA", "AREA",
     "QUANTIDADE_PLT", "DATA_FABRICACAO", "SITUACAO2",
     "observacao", "DATA_HOJE", "CHECKLIST_MASTER",
     "TIPO_PALLET", "DATA_RECEBIMENTO", "PROCEDENCIA", "NF",
@@ -1148,25 +1148,31 @@ def sugestoes_estoque():
             )
             produtos = [r["PRODUTO"] for r in cursor.fetchall()]
 
-            cursor.execute(
-                """
-                SELECT DISTINCT lote
-                FROM estoque
-                WHERE lote IS NOT NULL AND lote <> ''
-                ORDER BY lote
-                """
-            )
-            lotes = [r["lote"] for r in cursor.fetchall()]
+            if _OPERACAO_ATUAL.get() == "teste_shelf":
+                # Heineken nao opera com lote/linha nesta auditoria.
+                # Nao consultar colunas que podem nao existir no banco.
+                lotes = []
+                linhas = []
+            else:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT lote
+                    FROM estoque
+                    WHERE lote IS NOT NULL AND lote <> ''
+                    ORDER BY lote
+                    """
+                )
+                lotes = [r["lote"] for r in cursor.fetchall()]
 
-            cursor.execute(
-                """
-                SELECT DISTINCT linha
-                FROM estoque
-                WHERE linha IS NOT NULL AND linha <> ''
-                ORDER BY linha
-                """
-            )
-            linhas = [r["linha"] for r in cursor.fetchall()]
+                cursor.execute(
+                    """
+                    SELECT DISTINCT linha
+                    FROM estoque
+                    WHERE linha IS NOT NULL AND linha <> ''
+                    ORDER BY linha
+                    """
+                )
+                linhas = [r["linha"] for r in cursor.fetchall()]
 
             cursor.execute(
                 """
