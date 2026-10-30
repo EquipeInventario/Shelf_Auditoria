@@ -39,13 +39,14 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 
 DB_NAME_BASE = os.getenv("DB_NAME_BASE", "base_ambev")
-DB_NAME_TESTE_SHELF = os.getenv("DB_NAME_TESTE_SHELF", "teste_shelf")
+# Banco oficial da Heineken, independente da Ambev.
+DB_NAME_HEINEKEN = os.getenv("DB_NAME_HEINEKEN", "base_cerveja")
 DB_NAME_INVENTARIO = os.getenv("DB_NAME_INVENTARIO", "inventario")
 
 # Uma API, rotas operacionais separadas e bancos definidos no servidor.
 CLIENTES = {
     "ambev": {"nome": "Ambev", "db": DB_NAME_BASE},
-    "teste_shelf": {"nome": "Teste Shelf", "db": DB_NAME_TESTE_SHELF},
+    "heineken": {"nome": "Heineken", "db": DB_NAME_HEINEKEN},
 }
 _OPERACAO_ATUAL: ContextVar[str] = ContextVar("shelf_operacao", default="ambev")
 _TABELAS_OPERACIONAIS = frozenset({
@@ -57,19 +58,19 @@ _TABELAS_OPERACIONAIS = frozenset({
 @app.middleware("http")
 async def selecionar_operacao(request: Request, call_next):
     # As rotas antigas continuam exclusivas da Ambev.
-    # A operacao de teste possui rotas proprias: /teste-shelf/...
-    operacao = ("teste_shelf" if request.url.path.startswith("/teste-shelf/")
+    # A operacao Heineken possui rotas proprias: /heineken/...
+    operacao = ("heineken" if request.url.path.startswith("/heineken/")
                 else "ambev")
     token = _OPERACAO_ATUAL.set(operacao)
     try:
-        if operacao == "teste_shelf" and request.method.upper() != "OPTIONS":
-            # Somente administradores podem testar a nova base nesta etapa.
+        if operacao == "heineken" and request.method.upper() != "OPTIONS":
+            # Acesso Heineken restrito ao administrador conforme politica atual.
             _exigir_sessao_header(request.headers.get("X-Session-UUID"), PERFIS_ADMIN)
         return await call_next(request)
     except HTTPException as exc:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     except Exception as exc:
-        # Devolve JSON com CORS mesmo em falhas inesperadas no teste.
+        # Devolve JSON com CORS mesmo em falhas inesperadas na operacao Heineken.
         import traceback
         print(
             f"[API][{operacao}][{request.method} {request.url.path}] "
@@ -359,9 +360,9 @@ def _registrar_atividade_conn(
     detalhes: Any = None,
 ):
     detalhes_json = None
-    if _OPERACAO_ATUAL.get() == "teste_shelf":
+    if _OPERACAO_ATUAL.get() == "heineken":
         detalhes = {**(detalhes if isinstance(detalhes, dict) else {"conteudo": detalhes}),
-                    "cliente_operacao": "teste_shelf"}
+                    "cliente_operacao": "heineken"}
     if detalhes is not None:
         detalhes_json = json.dumps(
             detalhes,
@@ -403,9 +404,9 @@ def _registrar_atividade_segura(
     detalhes: Any = None,
 ):
     """Registra atividade sem fazer a operação principal falhar."""
-    # A produtividade do cliente teste ainda nao possui isolamento por sessao.
-    # Nao misturar eventos de testes com indicadores reais da Ambev.
-    if _OPERACAO_ATUAL.get() == "teste_shelf":
+    # O painel de produtividade nao separa eventos por cliente.
+    # Evitar misturar atividades da Heineken com os indicadores da Ambev.
+    if _OPERACAO_ATUAL.get() == "heineken":
         return
     conn, _ = _open_db("app_atividades")
     try:
@@ -585,7 +586,7 @@ def _colunas_gravaveis(conn, table_name: str) -> dict:
 
 def _ajustar_escrita_cliente(conn, table_name: str, data: dict) -> dict:
     """Somente Heineken: adaptar colunas da API ao esquema atual do banco."""
-    if _OPERACAO_ATUAL.get() != "teste_shelf":
+    if _OPERACAO_ATUAL.get() != "heineken":
         return data
     gravaveis = _colunas_gravaveis(conn, table_name)
     ajustado = {}
@@ -598,20 +599,110 @@ def _ajustar_escrita_cliente(conn, table_name: str, data: dict) -> dict:
         else:
             descartadas.append(str(coluna))
     if descartadas:
-        print(f"[teste_shelf] {table_name}: campos nao gravaveis ignorados: {', '.join(descartadas)}")
+        print(f"[heineken] {table_name}: campos nao gravaveis ignorados: {', '.join(descartadas)}")
     if not ajustado:
         raise HTTPException(status_code=400, detail="Nenhum campo gravavel recebido")
     return ajustado
 
 
-def _insert_row(table_name: str, data: Dict[str, Any]):
+def _registrar_historico_estoque_heineken(
+    conn, antes: Optional[dict], depois: Optional[dict],
+    item_id: int, usuario_app: Optional[str], operacao: str,
+):
+    """Grava a auditoria na MESMA transacao do estoque da Heineken.
+
+    Compara imagens reais da linha antes/depois. Ausencia de informacao
+    recebe a mesma representacao nos dois lados; nao cria mudanca ficticia.
+    Nao altera o schema e nao e executada para a Ambev.
+    """
+    nome = _norm_text(usuario_app).split(" - ")[0].strip().upper()
+    if not nome:
+        nome = "USUARIO"
+    acao = "EXCLUÍDO" if operacao == "excluir" else "EDITADO"
+    prefixo = f"{acao} POR "
+    nome = nome[:40 - len(prefixo) - len(" APP")]
+    payload = {
+        "USUARIO_SISTEMA": f"{prefixo}{nome} APP",
+        "DATA_HORA": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "id_relacao": str(item_id),
+    }
+
+    campos = (
+        ("PRODUTO", ("PRODUTO",), "texto", "[00000]"),
+        # Colunas historicas do banco oficial: apenas espelhar, nao editar.
+        ("LOTE", ("lote", "LOTE"), "texto", "[00000]"),
+        ("LINHA", ("linha", "LINHA"), "texto", "[00000]"),
+        ("documento_extra", ("documento_extra", "DOCUMENTO_EXTRA"), "texto", "[00000]"),
+        ("FORNECEDOR", ("FORNECEDOR", "fornecedor"), "texto", "[00000]"),
+        ("AZ", ("AZ",), "inteiro", 0),
+        ("QD", ("QD",), "texto", "[00000]"),
+        ("RUA", ("RUA",), "inteiro", 0),
+        ("AREA", ("AREA",), "area", "A"),
+        ("QUANTIDADE_PACK", ("QUANTIDADE_PACK",), "inteiro", 0),
+        ("QUANTIDADE_PLT", ("QUANTIDADE_PLT",), "inteiro", 0),
+        ("TIPO_PALLET", ("TIPO_PALLET",), "texto", "[00000]"),
+        ("PROCEDENCIA", ("PROCEDENCIA",), "texto", "[00000]"),
+        ("DATA_FABRICACAO", ("DATA_FABRICACAO",), "data", "2000-01-01"),
+        ("SITUACAO", ("SITUACAO2", "SITUACAO"), "texto", "LIBERADO"),
+        ("OBSERVACAO", ("observacao", "OBSERVACAO"), "texto", "[00000]"),
+        ("PROVISIONADO", ("PROVISIONADO",), "texto", "[00000]"),
+        ("DESCARTE_EFETIVO", ("DESCARTE_EFETIVO",), "texto", "[00000]"),
+        ("MOTIVO", ("MOTIVO",), "texto", "[00000]"),
+        ("RNC", ("RNC",), "texto", "[00000]"),
+        ("DISPOSICAO", ("DISPOSICAO",), "texto", "[00000]"),
+        ("DATA_L_COMERC", ("DATA_L_COMERC",), "data", "2000-01-01"),
+        ("DATA_DISP", ("DATA_DISP",), "data", "2000-01-01"),
+        ("MOTIVO_DESCARTE", ("MOTIVO_DESCARTE",), "texto", "[00000]"),
+    )
+
+    def campo_valor(registro, chaves, tipo, padrao):
+        if registro is None:
+            return padrao
+        bruto = next((registro[k] for k in chaves
+                      if k in registro and registro[k] is not None), None)
+        if bruto is None or not str(bruto).strip():
+            return padrao
+        if tipo == "inteiro":
+            numero = _norm_int(bruto)
+            return numero if numero is not None and numero >= 0 else padrao
+        if tipo == "data":
+            if isinstance(bruto, (datetime, date)):
+                return bruto.strftime("%Y-%m-%d")
+            return str(bruto).strip()[:10]
+        if tipo == "area":
+            return str(bruto).strip()[:1]
+        return str(bruto).strip()
+
+    for nome_campo, origens, tipo, padrao in campos:
+        anterior = campo_valor(antes, origens, tipo, padrao)
+        posterior = campo_valor(depois, origens, tipo, padrao)
+        if operacao == "excluir":
+            posterior = 0 if tipo == "inteiro" else (
+                padrao if tipo in ("data", "area") else "[EXCLUIDO]"
+            )
+        payload[nome_campo + "_ANTES"] = anterior
+        payload[nome_campo + "_DEPOIS"] = posterior
+
+    payload = _ajustar_escrita_cliente(conn, "historico_alteracoes", payload)
+    colunas = list(payload)
+    sql_campos = ", ".join(f"`{coluna}`" for coluna in colunas)
+    sql_valores = ", ".join("%s" for _ in colunas)
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"INSERT INTO historico_alteracoes ({sql_campos}) VALUES ({sql_valores})",
+            [payload[coluna] for coluna in colunas],
+        )
+
+
+def _insert_row(table_name: str, data: Dict[str, Any], usuario_app: Optional[str] = None,
+                registrar_historico: bool = False):
     conn, _ = _open_db(table_name)
 
     try:
         data = _ensure_dict(data)
         if not data:
             raise HTTPException(status_code=400, detail="Payload vazio")
-        if table_name == "historico_alteracoes" and _OPERACAO_ATUAL.get() == "teste_shelf":
+        if table_name == "historico_alteracoes" and _OPERACAO_ATUAL.get() == "heineken":
             data = dict(data)
             if data.get("USUARIO_SISTEMA") is not None:
                 data["USUARIO_SISTEMA"] = str(data["USUARIO_SISTEMA"])[:40]
@@ -628,6 +719,12 @@ def _insert_row(table_name: str, data: Dict[str, Any]):
                 values,
             )
             new_id = cursor.lastrowid
+            if registrar_historico and table_name == "estoque" and _OPERACAO_ATUAL.get() == "heineken":
+                cursor.execute("SELECT * FROM estoque WHERE ID = %s", (new_id,))
+                depois = cursor.fetchone()
+                _registrar_historico_estoque_heineken(
+                    conn, None, depois, new_id, usuario_app, "inserir"
+                )
 
         conn.commit()
         return {"status": "ok", "ID": new_id}
@@ -642,7 +739,8 @@ def _insert_row(table_name: str, data: Dict[str, Any]):
         conn.close()
 
 
-def _update_row(table_name: str, item_id: int, data: Dict[str, Any]):
+def _update_row(table_name: str, item_id: int, data: Dict[str, Any], usuario_app: Optional[str] = None,
+                registrar_historico: bool = False):
     conn, pk = _open_db(table_name)
 
     try:
@@ -651,11 +749,13 @@ def _update_row(table_name: str, item_id: int, data: Dict[str, Any]):
             raise HTTPException(status_code=400, detail="Nada para atualizar")
 
         with conn.cursor() as cursor:
-            cursor.execute(
-                f"SELECT `{pk}` FROM `{table_name}` WHERE `{pk}` = %s LIMIT 1",
-                (item_id,),
-            )
-            if not cursor.fetchone():
+            if registrar_historico:
+                consulta = f"SELECT * FROM `{table_name}` WHERE `{pk}` = %s LIMIT 1 FOR UPDATE"
+            else:
+                consulta = f"SELECT `{pk}` FROM `{table_name}` WHERE `{pk}` = %s LIMIT 1"
+            cursor.execute(consulta, (item_id,))
+            antes = cursor.fetchone()
+            if not antes:
                 raise HTTPException(status_code=404, detail="Registro não encontrado")
 
             data = _ajustar_escrita_cliente(conn, table_name, data)
@@ -668,6 +768,12 @@ def _update_row(table_name: str, item_id: int, data: Dict[str, Any]):
                 f"UPDATE `{table_name}` SET {set_sql} WHERE `{pk}` = %s",
                 values,
             )
+            if registrar_historico and table_name == "estoque" and _OPERACAO_ATUAL.get() == "heineken":
+                cursor.execute("SELECT * FROM estoque WHERE ID = %s", (item_id,))
+                depois = cursor.fetchone()
+                _registrar_historico_estoque_heineken(
+                    conn, antes, depois, item_id, usuario_app, "editar"
+                )
 
         conn.commit()
         return {"status": "ok"}
@@ -682,22 +788,29 @@ def _update_row(table_name: str, item_id: int, data: Dict[str, Any]):
         conn.close()
 
 
-def _delete_row(table_name: str, item_id: int):
+def _delete_row(table_name: str, item_id: int, usuario_app: Optional[str] = None,
+                registrar_historico: bool = False):
     conn, pk = _open_db(table_name)
 
     try:
         with conn.cursor() as cursor:
-            cursor.execute(
-                f"SELECT `{pk}` FROM `{table_name}` WHERE `{pk}` = %s LIMIT 1",
-                (item_id,),
-            )
-            if not cursor.fetchone():
+            if registrar_historico:
+                consulta = f"SELECT * FROM `{table_name}` WHERE `{pk}` = %s LIMIT 1 FOR UPDATE"
+            else:
+                consulta = f"SELECT `{pk}` FROM `{table_name}` WHERE `{pk}` = %s LIMIT 1"
+            cursor.execute(consulta, (item_id,))
+            antes = cursor.fetchone()
+            if not antes:
                 raise HTTPException(status_code=404, detail="Registro não encontrado")
 
             cursor.execute(
                 f"DELETE FROM `{table_name}` WHERE `{pk}` = %s",
                 (item_id,),
             )
+            if registrar_historico and table_name == "estoque" and _OPERACAO_ATUAL.get() == "heineken":
+                _registrar_historico_estoque_heineken(
+                    conn, antes, None, item_id, usuario_app, "excluir"
+                )
 
         conn.commit()
         return {"status": "ok"}
@@ -721,7 +834,7 @@ def _fetch_produto_row(conn, produto: str):
         return None
 
     with conn.cursor() as cursor:
-        if _OPERACAO_ATUAL.get() == "teste_shelf":
+        if _OPERACAO_ATUAL.get() == "heineken":
             # A base Heineken nao possui todas as colunas da Ambev
             # (por exemplo, exigeLinha). SELECT * usa o esquema existente.
             cursor.execute(
@@ -757,7 +870,7 @@ def _fetch_produto_row(conn, produto: str):
 def _get_produto_packs(produto: str) -> int:
     conn, _ = _open_db("produtos")
     try:
-        if _OPERACAO_ATUAL.get() == "teste_shelf":
+        if _OPERACAO_ATUAL.get() == "heineken":
             # Calcular PACKS usando somente os campos realmente necessarios.
             # Evita depender de colunas opcionais do cadastro de produtos.
             with conn.cursor() as cursor:
@@ -942,6 +1055,12 @@ def _preparar_estoque_heineken(
                 valor = numero
         elif campo == "PRODUTO":
             valor = _norm_text(valor)
+        elif campo == "DATA_HOJE" and valor is not None:
+            # O Flutter envia ISO com hora; no banco oficial a coluna e DATE.
+            try:
+                valor = date.fromisoformat(str(valor).strip()[:10]).isoformat()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="DATA_HOJE invalida")
         payload[campo] = valor
 
     if ignorados:
@@ -1000,7 +1119,7 @@ def _preparar_estoque_heineken(
 def _prepare_estoque_payload(
     data: Dict[str, Any], item_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if _OPERACAO_ATUAL.get() == "teste_shelf":
+    if _OPERACAO_ATUAL.get() == "heineken":
         return _preparar_estoque_heineken(data, item_id=item_id)
     return _preparar_estoque_ambev(data, item_id=item_id)
 
@@ -1030,22 +1149,37 @@ def listar_clientes_configurados(
     return [{"id": codigo, "nome": cfg["nome"]} for codigo, cfg in CLIENTES.items()]
 
 
-@app.get("/teste-shelf/validar")
+@app.get("/heineken/validar")
 def validar_operacao(
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
     _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
-    tabelas = ("estoque", "produtos", "historico_alteracoes")
+    # Validacao somente de leitura: banco e colunas indispensaveis.
+    tabelas = (
+        "estoque", "produtos", "historico_alteracoes",
+        "historico_historico", "historico_recebimento", "historico_expedicao",
+    )
+    obrigatorios = {
+        "estoque": {"ID", "PRODUTO", "QUANTIDADE_PLT", "QUANTIDADE_PACK", "DATA_HOJE"},
+        "produtos": {"PRODUTO", "PACKS", "SHELF", "VALIDADE_DIAS"},
+        "historico_alteracoes": {"ID", "id_relacao", "USUARIO_SISTEMA", "PRODUTO_ANTES", "PRODUTO_DEPOIS"},
+    }
+    faltantes = {}
     for tabela in tabelas:
         conn, _ = _open_db(tabela)
         try:
-            with conn.cursor() as cursor:
-                cursor.execute(f"SELECT 1 FROM `{tabela}` LIMIT 1")
+            colunas = _colunas_gravaveis(conn, tabela)
+            ausentes = sorted(coluna for coluna in obrigatorios.get(tabela, ())
+                              if coluna.lower() not in colunas)
+            if ausentes:
+                faltantes[tabela] = ausentes
         finally:
             conn.close()
+    if faltantes:
+        raise HTTPException(status_code=503, detail={"colunas_ausentes": faltantes})
     return {
-        "status": "ok", "cliente": _OPERACAO_ATUAL.get(),
-        "tabelas_verificadas": list(tabelas),
+        "status": "ok", "cliente": "heineken", "banco": DB_NAME_HEINEKEN,
+        "tabelas_verificadas": list(tabelas), "somente_leitura": True,
     }
 
 
@@ -1148,7 +1282,7 @@ def sugestoes_estoque():
             )
             produtos = [r["PRODUTO"] for r in cursor.fetchall()]
 
-            if _OPERACAO_ATUAL.get() == "teste_shelf":
+            if _OPERACAO_ATUAL.get() == "heineken":
                 # Heineken nao opera com lote/linha nesta auditoria.
                 # Nao consultar colunas que podem nao existir no banco.
                 lotes = []
@@ -1214,10 +1348,15 @@ def obter_estoque(item_id: int):
 def inserir_estoque(
     data: Dict[str, Any],
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+    x_historico_integrado: Optional[str] = Header(None, alias="X-Historico-Integrado"),
 ):
     sessao = _exigir_sessao_header(x_session_uuid)
+    integrado = _OPERACAO_ATUAL.get() == "heineken" and x_historico_integrado == "1"
     payload = _prepare_estoque_payload(data)
-    resultado = _insert_row("estoque", payload)
+    resultado = _insert_row("estoque", payload, usuario_app=sessao.get("nome") or data.get("usuario_app"),
+                            registrar_historico=integrado)
+    if integrado:
+        resultado["historico_integrado"] = True
     novo_id = resultado.get("ID") or resultado.get("id")
 
     _registrar_atividade_segura(
@@ -1239,10 +1378,15 @@ def atualizar_estoque(
     item_id: int,
     data: Dict[str, Any],
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+    x_historico_integrado: Optional[str] = Header(None, alias="X-Historico-Integrado"),
 ):
     sessao = _exigir_sessao_header(x_session_uuid)
+    integrado = _OPERACAO_ATUAL.get() == "heineken" and x_historico_integrado == "1"
     payload = _prepare_estoque_payload(data, item_id=item_id)
-    resultado = _update_row("estoque", item_id, payload)
+    resultado = _update_row("estoque", item_id, payload, usuario_app=sessao.get("nome") or data.get("usuario_app"),
+                            registrar_historico=integrado)
+    if integrado:
+        resultado["historico_integrado"] = True
 
     _registrar_atividade_segura(
         sessao=sessao,
@@ -1262,9 +1406,14 @@ def atualizar_estoque(
 def deletar_estoque(
     item_id: int,
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
+    x_historico_integrado: Optional[str] = Header(None, alias="X-Historico-Integrado"),
 ):
     sessao = _exigir_sessao_header(x_session_uuid)
-    resultado = _delete_row("estoque", item_id)
+    integrado = _OPERACAO_ATUAL.get() == "heineken" and x_historico_integrado == "1"
+    resultado = _delete_row("estoque", item_id, usuario_app=sessao.get("nome"),
+                            registrar_historico=integrado)
+    if integrado:
+        resultado["historico_integrado"] = True
 
     _registrar_atividade_segura(
         sessao=sessao,
@@ -1849,10 +1998,10 @@ def registrar_atividade(
     referencia_id = _norm_text(data.get("referencia_id")) or None
     detalhes = data.get("detalhes")
 
-    if _norm_text(data.get("cliente_operacao")) == "teste_shelf":
-        # Testes sao isolados do painel de produtividade da Ambev.
+    if _norm_text(data.get("cliente_operacao")) == "heineken":
+        # A operacao Heineken nao compartilha indicadores com a Ambev.
         _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
-        return {"status": "ok", "detalhe": "atividade de teste nao contabilizada"}
+        return {"status": "ok", "detalhe": "atividade Heineken nao contabilizada no painel Ambev"}
 
     if not tipo_evento:
         raise HTTPException(status_code=400, detail="tipo_evento é obrigatório")
@@ -1904,8 +2053,8 @@ def painel_produtividade(
     incluir_gestao: bool = False,
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
-    if _OPERACAO_ATUAL.get() == "teste_shelf":
-        raise HTTPException(status_code=409, detail="Produtividade teste_shelf ainda nao habilitada: separacao de atividades pendente")
+    if _OPERACAO_ATUAL.get() == "heineken":
+        raise HTTPException(status_code=409, detail="Produtividade Heineken nao disponivel: indicadores por cliente nao implementados")
     sessao_uuid = _get_session_uuid(header_value=x_session_uuid)
     data_consulta = _parse_data_ref(data_ref)
 
@@ -2138,8 +2287,8 @@ def produtividade_colaborador(
     limit_atividades: int = 500,
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
-    if _OPERACAO_ATUAL.get() == "teste_shelf":
-        raise HTTPException(status_code=409, detail="Produtividade teste_shelf ainda nao habilitada: separacao de atividades pendente")
+    if _OPERACAO_ATUAL.get() == "heineken":
+        raise HTTPException(status_code=409, detail="Produtividade Heineken nao disponivel: indicadores por cliente nao implementados")
     sessao_uuid = _get_session_uuid(header_value=x_session_uuid)
     data_consulta = _parse_data_ref(data_ref)
     limit_atividades, _ = _safe_limit_offset(
@@ -2430,7 +2579,7 @@ def historico_expedicao_por_checklist(checklist: str):
     finally:
         conn.close()
 # =========================================================
-# TESTE SHELF: MESMA API, ENDPOINTS EXCLUSIVOS
+# HEINEKEN: MESMA API, ROTAS PROPRIAS NO BANCO OFICIAL
 # =========================================================
 # O mobile inventario_app usa este mesmo principio (rotas distintas por
 # operacao). Mantemos os endpoints originais imutaveis para a Ambev.
@@ -2448,9 +2597,9 @@ for _rota in _rotas_ambev:
     ):
         continue
     app.add_api_route(
-        "/teste-shelf" + _rota.path,
+        "/heineken" + _rota.path,
         _rota.endpoint,
         methods=sorted(_rota.methods or {"GET"}),
-        name=_rota.name + "_teste_shelf",
+        name=_rota.name + "_heineken",
         include_in_schema=False,
     )
