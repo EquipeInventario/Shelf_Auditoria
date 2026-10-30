@@ -64,8 +64,9 @@ async def selecionar_operacao(request: Request, call_next):
     token = _OPERACAO_ATUAL.set(operacao)
     try:
         if operacao == "heineken" and request.method.upper() != "OPTIONS":
-            # Acesso Heineken restrito ao administrador conforme politica atual.
-            _exigir_sessao_header(request.headers.get("X-Session-UUID"), PERFIS_ADMIN)
+            # Operacao disponivel a qualquer usuario autenticado do Shelf.
+            # Preserva a verificacao de sessao, sem exigir perfil administrador.
+            _exigir_sessao_header(request.headers.get("X-Session-UUID"))
         return await call_next(request)
     except HTTPException as exc:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
@@ -1145,7 +1146,8 @@ def health():
 def listar_clientes_configurados(
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
-    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+    # Lista de operacoes para qualquer usuario com sessao valida.
+    _exigir_sessao_header(x_session_uuid)
     return [{"id": codigo, "nome": cfg["nome"]} for codigo, cfg in CLIENTES.items()]
 
 
@@ -1153,7 +1155,7 @@ def listar_clientes_configurados(
 def validar_operacao(
     x_session_uuid: Optional[str] = Header(None, alias="X-Session-UUID"),
 ):
-    _exigir_sessao_header(x_session_uuid, PERFIS_ADMIN)
+    _exigir_sessao_header(x_session_uuid)
     # Validacao somente de leitura: banco e colunas indispensaveis.
     tabelas = (
         "estoque", "produtos", "historico_alteracoes",
